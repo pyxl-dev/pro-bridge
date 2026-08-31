@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import os
 import shlex
-import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -56,18 +55,30 @@ def resolve_start_command(custom_command: str | None = None) -> list[str] | None
 
 
 async def _tcp_ready(host: str, port: int) -> bool:
+    """Verify that the endpoint is actually Chromium CDP, not merely an open port."""
+    writer = None
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), timeout=0.75
         )
-        writer.close()
-        try:
-            await writer.wait_closed()
-        except Exception:
-            pass
-        return True
+        request = (
+            f"GET /json/version HTTP/1.1\r\nHost: {host}:{port}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode("ascii")
+        writer.write(request)
+        await writer.drain()
+        payload = await asyncio.wait_for(reader.read(8192), timeout=0.75)
+        first_line = payload.split(b"\r\n", 1)[0]
+        return b" 200 " in first_line and b"webSocketDebuggerUrl" in payload
     except Exception:
         return False
+    finally:
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
 
 
 async def launch_local_browser(
@@ -76,7 +87,7 @@ async def launch_local_browser(
     timeout: float = 20.0,
     custom_command: str | None = None,
 ) -> bool:
-    """Launch the dedicated browser and wait for its local CDP port.
+    """Launch the dedicated browser and wait for its local CDP endpoint.
 
     Returns False instead of launching anything when the configured CDP endpoint
     is remote/non-local. Raises when local auto-start is requested but no launcher
