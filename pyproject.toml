@@ -12,7 +12,7 @@ license = { text = "MIT" }
 keywords = ["mcp", "chatgpt", "playwright", "hermes", "claude-code", "llm", "agent"]
 dependencies = [
     "playwright>=1.40",
-    "mcp>=1.2",
+    "mcp>=1.2,<2",
     "uvicorn>=0.27",
 ]
 
