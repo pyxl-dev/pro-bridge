@@ -114,10 +114,6 @@ class ChatGPTDriver:
     async def new_chat(self):
         async with self._lock:
             page = await self._get_page(fresh=True)
-            try:
-                await page.bring_to_front()
-            except Exception:
-                pass
             return {"url": page.url, "conversation_id": None}
 
     async def ask(self, prompt, conversation_id=None):
@@ -131,10 +127,6 @@ class ChatGPTDriver:
                 conversation_id,
                 fresh=conversation_id is None,
             )
-            try:
-                await page.bring_to_front()
-            except Exception:
-                pass
 
             model_holder = {}
 
