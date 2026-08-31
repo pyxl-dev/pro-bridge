@@ -81,6 +81,44 @@ def _effective_session(session: str | None, ctx: Context) -> tuple[str | None, s
     return resolved, source
 
 
+async def _new_chat_for_session(
+    effective_session: str | None,
+    session_source: str,
+) -> dict:
+    """Navigate first, then detach the caller session only after success.
+
+    The previous implementation reset the persistent mapping before asking the
+    browser to open a fresh chat. A transient CDP/navigation failure therefore
+    lost the caller's last known-good conversation. Keep the mapping intact until
+    the browser operation succeeds so chatgpt_new_chat is fail-closed.
+    """
+    async with _session_lock:
+        previous = _sessions.get(effective_session) if effective_session else None
+
+        # Do not mutate persistent session state before the browser operation has
+        # succeeded. If this raises, the old mapping remains available.
+        result = await _driver.new_chat()
+
+        if effective_session:
+            _sessions.reset(effective_session)
+
+        result.update(
+            {
+                "session": effective_session,
+                "session_source": session_source,
+                "previous_conversation_id": previous,
+                "reset": bool(effective_session),
+            }
+        )
+        log.info(
+            "chatgpt_new_chat: session=%s source=%s previous=%s",
+            effective_session,
+            session_source,
+            previous,
+        )
+        return result
+
+
 @mcp.tool()
 async def chatgpt_ask(
     prompt: str,
@@ -182,28 +220,13 @@ async def chatgpt_new_chat(
     `session` is a fallback for clients without an identity header. The old
     ChatGPT thread is not deleted; it is simply detached from the resolved
     session. The next chatgpt_ask starts a new conversation and stores its id.
+
+    The persistent mapping is cleared only after the browser successfully opens
+    the new-chat page; a transient browser failure leaves the old mapping intact.
     """
     effective_session, session_source = _effective_session(session, ctx)
     await _ensure_browser_available()
-
-    async with _session_lock:
-        previous = _sessions.reset(effective_session) if effective_session else None
-        result = await _driver.new_chat()
-        result.update(
-            {
-                "session": effective_session,
-                "session_source": session_source,
-                "previous_conversation_id": previous,
-                "reset": bool(effective_session),
-            }
-        )
-        log.info(
-            "chatgpt_new_chat: session=%s source=%s previous=%s",
-            effective_session,
-            session_source,
-            previous,
-        )
-        return result
+    return await _new_chat_for_session(effective_session, session_source)
 
 
 @mcp.tool()
