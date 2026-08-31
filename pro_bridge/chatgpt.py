@@ -12,6 +12,7 @@ import time
 from playwright.async_api import async_playwright
 
 from . import config
+from .browser_guard import launch_local_browser
 
 log = logging.getLogger("pro_bridge.chatgpt")
 
@@ -32,10 +33,46 @@ class ChatGPTDriver:
     async def _ensure(self):
         if self._browser is not None and self._browser.is_connected():
             return
+
+        # Do not retain a disconnected Browser object across recovery attempts.
+        self._browser = None
+
         if self._pw is None:
             self._pw = await async_playwright().start()
+
         log.info("Connecting to Chrome via CDP at %s", config.CDP_URL)
-        self._browser = await self._pw.chromium.connect_over_cdp(config.CDP_URL)
+        try:
+            self._browser = await self._pw.chromium.connect_over_cdp(config.CDP_URL)
+            return
+        except Exception as first_error:
+            # server._ensure_browser_available() can succeed and then lose the
+            # browser before Playwright actually connects. Recover once at the
+            # connection boundary so that race does not fail the MCP call.
+            if not config.AUTO_START_BROWSER:
+                raise
+
+            log.warning(
+                "CDP connection failed at %s; attempting one browser recovery: %s",
+                config.CDP_URL,
+                first_error,
+            )
+            recovered = await launch_local_browser(
+                config.CDP_URL,
+                timeout=config.BROWSER_START_TIMEOUT,
+                custom_command=config.BROWSER_START_COMMAND or None,
+            )
+            if not recovered:
+                # Remote/non-local CDP endpoints must never trigger a local
+                # browser launch. Preserve the original connection failure.
+                raise
+
+            log.info(
+                "Browser recovery succeeded; retrying CDP connection at %s",
+                config.CDP_URL,
+            )
+            # Exactly one reconnect attempt: if this fails, propagate that
+            # second error rather than entering an auto-restart loop.
+            self._browser = await self._pw.chromium.connect_over_cdp(config.CDP_URL)
 
     async def _chatgpt_page(self):
         await self._ensure()
