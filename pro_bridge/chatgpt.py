@@ -179,18 +179,82 @@ class ChatGPTDriver:
             )
         return page, recovered_id
 
+    async def _assistant_snapshot(self, page):
+        """Return the last non-empty assistant node and its completion metadata.
+
+        ChatGPT can render multiple assistant nodes for one visible turn, including
+        an empty trailing placeholder after the real answer. Selection therefore
+        walks backwards and ignores empty nodes. Text, model slug and completion
+        controls are all read from the same selected assistant/turn so they cannot
+        disagree about which response is complete.
+        """
+        return await page.evaluate(
+            """() => {
+                const visible = (el) => {
+                    if (!el) return false;
+                    const style = window.getComputedStyle(el);
+                    const rect = el.getBoundingClientRect();
+                    return style.display !== 'none' &&
+                           style.visibility !== 'hidden' &&
+                           rect.width > 0 && rect.height > 0;
+                };
+
+                const assistants = Array.from(document.querySelectorAll(
+                    '[data-message-author-role=assistant]'
+                ));
+
+                for (let index = assistants.length - 1; index >= 0; index -= 1) {
+                    const assistant = assistants[index];
+                    const markdowns = Array.from(assistant.querySelectorAll('.markdown'));
+                    let text = '';
+
+                    for (let mdIndex = markdowns.length - 1; mdIndex >= 0; mdIndex -= 1) {
+                        const candidate = (markdowns[mdIndex].innerText || '').trim();
+                        if (candidate) {
+                            text = candidate;
+                            break;
+                        }
+                    }
+
+                    if (!text) {
+                        text = (assistant.innerText || '').trim();
+                    }
+                    if (!text) {
+                        continue;
+                    }
+
+                    const turn = assistant.closest('[data-testid^="conversation-turn-"]');
+                    const copy = turn
+                        ? turn.querySelector('[data-testid="copy-turn-action-button"]')
+                        : null;
+                    const turnStop = turn
+                        ? turn.querySelector('[data-testid="stop-button"]')
+                        : null;
+                    const stop = turnStop || document.querySelector('[data-testid="stop-button"]');
+
+                    return {
+                        index,
+                        text,
+                        model: assistant.getAttribute('data-message-model-slug'),
+                        copyVisible: visible(copy),
+                        stopVisible: visible(stop),
+                        turnId: turn ? turn.getAttribute('data-testid') : null,
+                    };
+                }
+
+                return null;
+            }"""
+        )
+
     async def _last_assistant_slug(self, page):
-        # Ground truth when available: assistant turns carry the model slug that
-        # produced them. The attribute is not guaranteed, so absence is allowed.
+        # Ground truth when available: use the same non-empty assistant node that
+        # answer extraction and completion detection use.
         try:
-            return await page.evaluate(
-                """() => {
-                    const els = document.querySelectorAll('[data-message-author-role=assistant]');
-                    if (!els.length) return null;
-                    return els[els.length - 1].getAttribute('data-message-model-slug');
-                }"""
-            )
-        except Exception:
+            snapshot = await self._assistant_snapshot(page)
+            return snapshot.get("model") if snapshot else None
+        except Exception as exc:
+            if self._is_driver_connection_error(exc):
+                raise
             return None
 
     async def current_model(self, page):
@@ -269,24 +333,10 @@ class ChatGPTDriver:
             return {"text": text, "model": model, "conversation_id": conv}
 
     async def _extract_answer(self, page):
-        loc = page.locator(ASSISTANT).last
-
-        # Prefer rendered markdown when present. Fall back to the semantic
-        # assistant container for non-markdown answer types.
-        md = loc.locator(".markdown")
-        try:
-            if await md.count():
-                text = (await md.last.inner_text()).strip()
-                if text:
-                    return text
-        except Exception as exc:
-            if self._is_driver_connection_error(exc):
-                raise
-
-        text = (await loc.inner_text()).strip()
-        if not text:
-            raise RuntimeError("Latest ChatGPT assistant turn contains no text.")
-        return text
+        snapshot = await self._assistant_snapshot(page)
+        if not snapshot or not snapshot.get("text"):
+            raise RuntimeError("No non-empty ChatGPT assistant turn was found.")
+        return snapshot["text"]
 
     async def _send(self, page, prompt):
         composer = page.locator("#prompt-textarea")
@@ -329,44 +379,15 @@ class ChatGPTDriver:
         await composer.press("Enter")
 
     async def _completion_state(self, page):
-        """Return high-signal generation state from the current DOM.
-
-        Copy action in the latest assistant turn is a strong completion signal.
-        A visible Stop button is a strong in-progress signal. Both are treated as
-        optional because ChatGPT's DOM changes over time.
-        """
+        """Return completion state for the same non-empty assistant we extract."""
         try:
-            return await page.evaluate(
-                """() => {
-                    const visible = (el) => {
-                        if (!el) return false;
-                        const style = window.getComputedStyle(el);
-                        const rect = el.getBoundingClientRect();
-                        return style.display !== 'none' &&
-                               style.visibility !== 'hidden' &&
-                               rect.width > 0 && rect.height > 0;
-                    };
-
-                    const assistants = document.querySelectorAll(
-                        '[data-message-author-role=assistant]'
-                    );
-                    const assistant = assistants.length
-                        ? assistants[assistants.length - 1]
-                        : null;
-                    const turn = assistant
-                        ? assistant.closest('[data-testid^="conversation-turn-"]')
-                        : null;
-                    const copy = turn
-                        ? turn.querySelector('[data-testid="copy-turn-action-button"]')
-                        : null;
-                    const stop = document.querySelector('[data-testid="stop-button"]');
-
-                    return {
-                        copyVisible: visible(copy),
-                        stopVisible: visible(stop),
-                    };
-                }"""
-            )
+            snapshot = await self._assistant_snapshot(page)
+            if not snapshot:
+                return {"copyVisible": False, "stopVisible": False}
+            return {
+                "copyVisible": bool(snapshot.get("copyVisible")),
+                "stopVisible": bool(snapshot.get("stopVisible")),
+            }
         except Exception as exc:
             if self._is_driver_connection_error(exc):
                 raise
@@ -382,10 +403,10 @@ class ChatGPTDriver:
     ):
         """Wait for one new complete assistant turn under a single time budget.
 
-        Unlike page.wait_for_function(), polling uses short Playwright RPCs so a
-        dead driver transport is detected and recovered promptly. The prompt has
-        already been sent when this method runs; recovery therefore only
-        reattaches to the existing conversation and never calls _send().
+        Polling uses one short DOM snapshot per iteration. The snapshot ignores
+        empty trailing assistant placeholders and carries text/completion state
+        from one selected assistant node. The prompt has already been sent when
+        this method runs; driver recovery therefore never calls _send().
         """
         active_conversation = conversation_id
         recovered_driver = False
@@ -397,19 +418,12 @@ class ChatGPTDriver:
                 if active_conversation is None:
                     active_conversation = self._conversation_id_from_url(page.url)
 
-                count = await page.locator(ASSISTANT).count()
-                if count <= before:
+                snapshot = await self._assistant_snapshot(page)
+                if not snapshot or snapshot.get("index", -1) < before:
                     await asyncio.sleep(0.75)
                     continue
 
-                try:
-                    current = await self._extract_answer(page)
-                except RuntimeError as exc:
-                    if self._is_driver_connection_error(exc):
-                        raise
-                    current = None
-
-                state = await self._completion_state(page)
+                current = snapshot.get("text") or None
                 now = time.monotonic()
 
                 if current:
@@ -417,16 +431,15 @@ class ChatGPTDriver:
                         last_text = current
                         stable_since = now
 
-                    # Copy is the strongest available UI completion signal and
-                    # is only exposed for a completed assistant turn.
-                    if state["copyVisible"]:
+                    # Copy belongs to the same selected non-empty assistant turn.
+                    if snapshot.get("copyVisible"):
                         return page, current, active_conversation
 
                     # DOM-drift fallback: unchanged text for 15 seconds with no
                     # visible Stop control. Use elapsed time rather than polling
                     # counts so scheduling jitter cannot shorten this guard.
                     if (
-                        not state["stopVisible"]
+                        not snapshot.get("stopVisible")
                         and stable_since is not None
                         and now - stable_since >= 15.0
                     ):

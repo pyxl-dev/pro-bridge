@@ -11,20 +11,17 @@ DRIVER_ERROR = RuntimeError("Connection closed while reading from the driver")
 
 
 class _CountLocator:
-    def __init__(self, side_effect=None, value=0):
-        self._side_effect = side_effect
+    def __init__(self, value=0):
         self._value = value
 
     async def count(self):
-        if self._side_effect is not None:
-            raise self._side_effect
         return self._value
 
 
 class _Page:
-    def __init__(self, *, url, locator):
+    def __init__(self, *, url, count=0):
         self.url = url
-        self._locator = locator
+        self._locator = _CountLocator(count)
         self.listeners = []
 
     def locator(self, _selector):
@@ -44,14 +41,16 @@ class InflightRecoveryTests(unittest.TestCase):
     def test_wait_for_answer_recovers_driver_once_and_returns_existing_reply(self):
         async def run():
             driver = ChatGPTDriver()
-            first_page = _Page(
-                url=f"https://chatgpt.com/c/{CONV}",
-                locator=_CountLocator(side_effect=DRIVER_ERROR),
-            )
-            recovered_page = _Page(
-                url=f"https://chatgpt.com/c/{CONV}",
-                locator=_CountLocator(value=1),
-            )
+            first_page = _Page(url=f"https://chatgpt.com/c/{CONV}")
+            recovered_page = _Page(url=f"https://chatgpt.com/c/{CONV}")
+            complete = {
+                "index": 0,
+                "text": "DONE",
+                "model": "gpt-test",
+                "copyVisible": True,
+                "stopVisible": False,
+                "turnId": "conversation-turn-1",
+            }
 
             with patch.object(
                 driver,
@@ -59,55 +58,8 @@ class InflightRecoveryTests(unittest.TestCase):
                 new=AsyncMock(return_value=(recovered_page, CONV)),
             ) as recover, patch.object(
                 driver,
-                "_extract_answer",
-                new=AsyncMock(return_value="DONE"),
-            ), patch.object(
-                driver,
-                "_completion_state",
-                new=AsyncMock(
-                    return_value={"copyVisible": True, "stopVisible": False}
-                ),
-            ):
-                page, text, conv = await driver._wait_for_answer(
-                    first_page,
-                    0,
-                    conversation_id=CONV,
-                    deadline=time.monotonic() + 1,
-                )
-
-            self.assertIs(page, recovered_page)
-            self.assertEqual(text, "DONE")
-            self.assertEqual(conv, CONV)
-            recover.assert_awaited_once_with(CONV)
-
-        asyncio.run(run())
-
-    def test_wait_for_answer_recovers_driver_loss_during_text_extraction(self):
-        async def run():
-            driver = ChatGPTDriver()
-            first_page = _Page(
-                url=f"https://chatgpt.com/c/{CONV}",
-                locator=_CountLocator(value=1),
-            )
-            recovered_page = _Page(
-                url=f"https://chatgpt.com/c/{CONV}",
-                locator=_CountLocator(value=1),
-            )
-
-            with patch.object(
-                driver,
-                "_recover_inflight_page",
-                new=AsyncMock(return_value=(recovered_page, CONV)),
-            ) as recover, patch.object(
-                driver,
-                "_extract_answer",
-                new=AsyncMock(side_effect=[DRIVER_ERROR, "DONE"]),
-            ), patch.object(
-                driver,
-                "_completion_state",
-                new=AsyncMock(
-                    return_value={"copyVisible": True, "stopVisible": False}
-                ),
+                "_assistant_snapshot",
+                new=AsyncMock(side_effect=[DRIVER_ERROR, complete]),
             ):
                 page, text, conv = await driver._wait_for_answer(
                     first_page,
@@ -126,24 +78,18 @@ class InflightRecoveryTests(unittest.TestCase):
     def test_wait_for_answer_never_loops_driver_recovery(self):
         async def run():
             driver = ChatGPTDriver()
-            first_page = _Page(
-                url=f"https://chatgpt.com/c/{CONV}",
-                locator=_CountLocator(side_effect=DRIVER_ERROR),
-            )
-            recovered_page = _Page(
-                url=f"https://chatgpt.com/c/{CONV}",
-                locator=_CountLocator(
-                    side_effect=RuntimeError(
-                        "Connection closed while reading from the driver"
-                    )
-                ),
-            )
+            first_page = _Page(url=f"https://chatgpt.com/c/{CONV}")
+            recovered_page = _Page(url=f"https://chatgpt.com/c/{CONV}")
 
             with patch.object(
                 driver,
                 "_recover_inflight_page",
                 new=AsyncMock(return_value=(recovered_page, CONV)),
-            ) as recover:
+            ) as recover, patch.object(
+                driver,
+                "_assistant_snapshot",
+                new=AsyncMock(side_effect=[DRIVER_ERROR, DRIVER_ERROR]),
+            ):
                 with self.assertRaisesRegex(RuntimeError, "Connection closed"):
                     await driver._wait_for_answer(
                         first_page,
@@ -159,16 +105,17 @@ class InflightRecoveryTests(unittest.TestCase):
     def test_wait_for_answer_does_not_mask_unrelated_playwright_error(self):
         async def run():
             driver = ChatGPTDriver()
-            page = _Page(
-                url=f"https://chatgpt.com/c/{CONV}",
-                locator=_CountLocator(side_effect=RuntimeError("selector exploded")),
-            )
+            page = _Page(url=f"https://chatgpt.com/c/{CONV}")
 
             with patch.object(
                 driver,
                 "_recover_inflight_page",
                 new_callable=AsyncMock,
-            ) as recover:
+            ) as recover, patch.object(
+                driver,
+                "_assistant_snapshot",
+                new=AsyncMock(side_effect=RuntimeError("selector exploded")),
+            ):
                 with self.assertRaisesRegex(RuntimeError, "selector exploded"):
                     await driver._wait_for_answer(
                         page,
@@ -181,17 +128,52 @@ class InflightRecoveryTests(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_wait_for_answer_ignores_previous_nonempty_turn_until_new_index(self):
+        async def run():
+            driver = ChatGPTDriver()
+            page = _Page(url=f"https://chatgpt.com/c/{CONV}")
+            previous = {
+                "index": 3,
+                "text": "PREVIOUS",
+                "model": "gpt-old",
+                "copyVisible": True,
+                "stopVisible": False,
+                "turnId": "conversation-turn-18",
+            }
+            current = {
+                "index": 4,
+                "text": "CURRENT",
+                "model": "gpt-new",
+                "copyVisible": True,
+                "stopVisible": False,
+                "turnId": "conversation-turn-20",
+            }
+
+            with patch.object(
+                driver,
+                "_assistant_snapshot",
+                new=AsyncMock(side_effect=[previous, current]),
+            ), patch(
+                "pro_bridge.chatgpt.asyncio.sleep",
+                new=AsyncMock(),
+            ):
+                _page, text, conv = await driver._wait_for_answer(
+                    page,
+                    4,
+                    conversation_id=CONV,
+                    deadline=time.monotonic() + 1,
+                )
+
+            self.assertEqual(text, "CURRENT")
+            self.assertEqual(conv, CONV)
+
+        asyncio.run(run())
+
     def test_ask_sends_prompt_exactly_once_when_waiter_returns_recovered_page(self):
         async def run():
             driver = ChatGPTDriver()
-            page = _Page(
-                url=f"https://chatgpt.com/c/{CONV}",
-                locator=_CountLocator(value=4),
-            )
-            recovered_page = _Page(
-                url=f"https://chatgpt.com/c/{CONV}",
-                locator=_CountLocator(value=5),
-            )
+            page = _Page(url=f"https://chatgpt.com/c/{CONV}", count=4)
+            recovered_page = _Page(url=f"https://chatgpt.com/c/{CONV}", count=5)
 
             with patch.object(
                 driver,
