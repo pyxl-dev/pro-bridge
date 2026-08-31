@@ -8,18 +8,85 @@ model. The bridge drives `chatgpt.com` over Chrome DevTools Protocol (CDP),
 waits for the visible assistant turn to finish, and returns the reply together
 with its `conversation_id`.
 
-## Current V1
+## Current V0.3
 
 The MCP server exposes three tools:
 
 | Tool | Purpose |
 |---|---|
-| `chatgpt_ask(prompt, conversation_id?)` | Ask ChatGPT. No id = **new chat**; passing an id continues that exact thread. |
-| `chatgpt_new_chat()` | Explicitly navigate the bridge browser to a fresh chat. |
-| `chatgpt_status()` | Check browser connection, current URL, model (when known), and conversation id. |
+| `chatgpt_ask(prompt, session?, conversation_id?)` | Ask ChatGPT. A named session automatically resumes its own mapped ChatGPT thread. |
+| `chatgpt_new_chat(session?)` | Reset one named session so its next message starts a new ChatGPT thread. |
+| `chatgpt_status(session?)` | Check browser state and optionally inspect the conversation mapped to one session. |
 
-File upload and image generation are intentionally left for the next milestone,
-after the text round-trip is validated against the current ChatGPT UI.
+File upload and image generation are intentionally left for the next milestone.
+
+## Named sessions for Hermes agents
+
+The recommended multi-agent contract is to use the **stable Hermes profile/bot
+name** as `session`.
+
+Example:
+
+```text
+chatgpt_ask(
+  prompt="Analyse ce bug et propose un correctif.",
+  session="developer"
+)
+```
+
+First call for `developer`:
+
+```text
+developer -> no mapping yet -> NEW ChatGPT conversation -> id AAA
+```
+
+Later calls:
+
+```text
+developer -> AAA -> continue the same ChatGPT conversation
+```
+
+Another profile stays isolated:
+
+```text
+business -> NEW ChatGPT conversation -> id BBB
+```
+
+The mapping is persisted by default in:
+
+```text
+~/.pro-bridge/sessions.json
+```
+
+so continuity survives Hermes and bridge restarts.
+
+To deliberately start a new topic for one profile:
+
+```text
+chatgpt_new_chat(session="developer")
+```
+
+This **does not delete** the previous ChatGPT conversation. It only removes the
+`developer -> AAA` mapping. The next `chatgpt_ask(..., session="developer")`
+creates a fresh ChatGPT conversation and stores the new id automatically.
+
+### Advanced/manual conversation id
+
+`conversation_id` remains available as an override:
+
+```text
+chatgpt_ask(
+  prompt="Continue ce thread précis.",
+  session="developer",
+  conversation_id="6a95826b-..."
+)
+```
+
+After a successful answer, `developer` becomes mapped to that explicit
+conversation id.
+
+If neither `session` nor `conversation_id` is passed, the bridge keeps the old
+stateless behavior: every call starts a new ChatGPT conversation.
 
 ## Why this fork differs from upstream
 
@@ -27,63 +94,72 @@ The original project was centered on GPT Pro. This fork generalizes the bridge
 for ordinary ChatGPT usage:
 
 - no GPT Pro requirement or strict-model rejection;
-- no model-specific MCP tool name;
-- `conversation_id=None` now **always starts a new conversation** instead of
-  accidentally reusing whichever `/c/...` tab happened to be open;
-- browser actions remain serialized with a lock so multiple agents cannot type
-  into the composer at the same time;
-- completion detection combines the latest turn's Copy action, visible Stop
-  state, and conservative text stability;
-- timeouts now fail explicitly instead of returning a potentially partial
-  answer;
+- named persistent `session -> conversation_id` routing for multi-agent Hermes;
+- `conversation_id=None` starts a new conversation when no named mapping exists;
+- browser actions are serialized so multiple agents cannot type into the same
+  composer simultaneously;
+- completion detection combines semantic assistant turns, Copy/Stop state, and
+  conservative text stability;
+- timeouts fail explicitly rather than returning potentially partial output;
 - generic `CHATGPT_BRIDGE_*` configuration names, with legacy upstream names
-  still accepted.
+  still accepted;
+- on macOS, the default launcher uses a genuine headed browser hidden in the
+  background because ChatGPT currently challenges native Chromium headless.
 
 ## Architecture
 
 ```text
-Hermes / MCP client
+Hermes agents
+ developer ─┐
+ business  ─┼─ session names
+ research  ─┘
         |
         | Streamable HTTP MCP
         v
    pro-bridge
+   session registry
         |
         | Playwright over CDP
         v
 Chrome / Brave / Edge
-(logged into chatgpt.com)
+(dedicated authenticated profile)
         |
         v
       ChatGPT
 ```
 
-The browser should be a dedicated profile. Login, cookies, challenges, and the
-normal ChatGPT frontend remain handled by the real browser.
-
 ## Quick start
 
-Python 3.10+ is required.
+Python 3.10+ is required. A virtual environment is recommended.
 
 ```bash
 git clone https://github.com/pyxl-dev/pro-bridge
 cd pro-bridge
-pip install -r requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Start the dedicated debug browser:
+### Browser
 
-```powershell
-# Windows
-powershell -ExecutionPolicy Bypass -File scripts\start-chrome-debug.ps1
-```
+On macOS/Linux:
 
 ```bash
-# macOS / Linux — auto-detects Chrome/Chromium/Brave/Edge
+# Normal operation. On macOS this runs a genuine browser hidden in background.
 ./scripts/start-chrome-debug.sh
+
+# Visible mode for login/account maintenance.
+./scripts/start-chrome-debug.sh --login
+
+# Stop the dedicated bridge browser.
+./scripts/start-chrome-debug.sh --stop
 ```
 
-Log into `chatgpt.com` in that browser once and leave the browser open.
+Both normal and login mode use the same persistent browser profile.
+
+Native `--headless` remains available only as an experimental diagnostic mode;
+ChatGPT currently serves a challenge page to `HeadlessChrome` on tested builds.
 
 Check the connection without sending anything:
 
@@ -104,33 +180,32 @@ python -m pro_bridge.server
 # http://127.0.0.1:8765/mcp by default
 ```
 
-## Hermes
+## Hermes MCP configuration
 
-Hermes supports HTTP MCP servers natively. A minimal local configuration is:
+For Hermes installations using JSON MCP config:
 
-```yaml
-mcp_servers:
-  chatgpt_web:
-    url: "http://127.0.0.1:8765/mcp"
+```json
+{
+  "mcpServers": {
+    "chatgpt-web": {
+      "url": "http://127.0.0.1:8765/mcp"
+    }
+  }
+}
 ```
 
-If the bridge is on another machine, bind it to a private interface/network,
-set `CHATGPT_BRIDGE_TOKEN`, and send the matching bearer token in the MCP
-headers.
+Each Hermes profile should pass its own stable profile/bot name as the `session`
+argument whenever it uses `chatgpt_ask`, `chatgpt_new_chat`, or session-specific
+`chatgpt_status`.
 
-The important tool contract for orchestration is:
+A useful agent instruction is:
 
 ```text
-chatgpt_ask(prompt)
-  -> {text, model, conversation_id}
-
-chatgpt_ask(follow_up, conversation_id=<previous id>)
-  -> same ChatGPT thread
+When using chatgpt-web, always pass your own stable Hermes profile name as
+`session`. Reuse that session for the same topic. When a genuinely new topic
+needs a clean ChatGPT context, call chatgpt_new_chat with that same session
+before the next chatgpt_ask.
 ```
-
-Each no-id call starts a fresh ChatGPT conversation. This makes the bridge safe
-to use from an orchestrator that may maintain several independent ChatGPT
-threads.
 
 ## Configuration
 
@@ -141,43 +216,18 @@ threads.
 | `CHATGPT_BRIDGE_PORT` | `8765` | MCP port |
 | `CHATGPT_BRIDGE_TOKEN` | _(none)_ | optional bearer token |
 | `CHATGPT_MODEL_SLUG` | _(empty)_ | optional model slug for new chats |
+| `CHATGPT_BRIDGE_SESSION_FILE` | `~/.pro-bridge/sessions.json` | persistent named-session registry |
 | `CHATGPT_BRIDGE_TIMEOUT` | `1800` | max seconds per answer |
 
 Legacy `PRO_BRIDGE_*`, `PRO_BRIDGE_TIMEOUT`, and `GPT_PRO_MODEL_SLUG` variables
-are accepted as fallbacks so existing upstream launch scripts/configurations do
-not break immediately.
+are accepted as fallbacks.
 
-## Completion and response extraction
+## Concurrency
 
-The bridge deliberately avoids parsing ChatGPT's private streaming protocol.
-
-It waits for a new semantic assistant turn:
-
-```css
-[data-message-author-role="assistant"]
-```
-
-Then it extracts rendered `.markdown` when available, falling back to the full
-assistant turn.
-
-Completion uses two paths:
-
-1. **High confidence:** the latest conversation turn exposes
-   `copy-turn-action-button` and the answer text is stable.
-2. **UI-drift fallback:** no visible Stop control and the answer text remains
-   unchanged for roughly 15 seconds.
-
-If neither condition is reached before the configured timeout, the call raises a
-timeout error rather than silently returning partial output.
-
-## Multi-agent behavior
-
-The browser is a single mutable UI, so all bridge operations are guarded by an
-`asyncio.Lock`.
-
-That means Hermes can issue calls from different agents without prompt text
-interleaving. They are executed sequentially, while each agent can preserve its
-own ChatGPT context by keeping the returned `conversation_id`.
+The browser is a single mutable UI. The bridge serializes calls with locks so
+separate Hermes agents cannot navigate/type over one another. Named sessions
+provide logical conversation isolation; calls are still executed sequentially
+through the single browser worker.
 
 ## Diagnostics
 
@@ -191,20 +241,20 @@ python probe_dom.py
 
 ## Next milestone
 
-- [ ] upload files through the hidden `input[type=file]`;
-- [ ] generate images through ChatGPT and download the resulting file;
+- [ ] upload files through ChatGPT;
+- [ ] generate/download images;
 - [ ] optional reference-image support;
-- [ ] automated DOM smoke test / CI fixtures;
-- [ ] improve multi-tab isolation if parallel browser workers are later needed.
+- [ ] automated DOM smoke tests;
+- [ ] optional multi-browser workers if true parallel execution is later needed.
 
 ## Security and operational notes
 
-- Keep the debug browser profile private: it contains an authenticated ChatGPT
-  session.
+- Keep the dedicated browser profile private: it contains an authenticated
+  ChatGPT session.
 - Keep the MCP server on localhost unless remote access is genuinely needed.
 - If remote access is needed, use a private network plus a bearer token.
-- UI automation can break when ChatGPT changes its frontend; the semantic
-  selectors are intentionally kept few and centralized in `pro_bridge/chatgpt.py`.
+- UI automation can break when ChatGPT changes its frontend; semantic selectors
+  are intentionally kept few and centralized in `pro_bridge/chatgpt.py`.
 - This is an independent project and is not affiliated with OpenAI.
 
 ## License
