@@ -1,26 +1,35 @@
 ---
-description: Structured debate with ChatGPT web through pro-bridge
+description: High-stakes debate with ChatGPT Web via pro-bridge MCP
 argument-hint: [question or decision; defaults to current context/selection]
 allowed-tools: mcp__chatgpt-web__chatgpt_ask, Read, Grep, Glob, Bash
 ---
 
-Run a focused multi-round debate between yourself and ChatGPT through
-`mcp__chatgpt-web__chatgpt_ask`.
+You are running a high-stakes debate between yourself and ChatGPT through the
+`mcp__chatgpt-web__chatgpt_ask` tool.
 
 ## Topic
 $ARGUMENTS
 
-1. Frame the question and take an initial position.
-2. Call `chatgpt_ask` with a self-contained prompt. Save the returned
-   `conversation_id`.
-3. Critique the answer, then call `chatgpt_ask` again with that same
-   `conversation_id` for a rebuttal.
-4. Default to two rounds. Add a third only when a material crux remains.
-5. Synthesize agreements, disagreements, and the final recommendation.
+If empty, infer it from the current conversation, the user's IDE selection, and
+the open files. State the topic explicitly before starting.
 
-Rules:
-- A call without `conversation_id` starts a new ChatGPT thread.
-- Always pass the same id for follow-ups in one debate.
-- Treat the ChatGPT answer as another model's evidence/argument, not authority.
-- If the MCP tool is unavailable, check that the bridge server and dedicated
-  browser are running.
+## Protocol
+1. Frame the question and what a good answer must satisfy. Take your own reasoned
+   position first.
+2. Call `chatgpt_ask` with the framing, all concrete context ChatGPT needs, your
+   position, and a request for its strongest objection.
+3. Rebut critically. If another ChatGPT turn is useful, call `chatgpt_ask` again.
+   With Hermes identity-header routing enabled, the bridge automatically keeps
+   this profile on its own ChatGPT conversation; no session id needs to be
+   supplied manually.
+4. Default to two rounds. Add a third only if a genuine crux remains unresolved.
+5. Synthesize agreement, disagreement, and your recommendation.
+
+## Rules
+- Do not manually invent or switch `session` names when Hermes profile identity
+  routing is enabled. The bridge derives the caller profile from the MCP request.
+- Use `chatgpt_new_chat()` first only when the debate genuinely needs a clean
+  ChatGPT context rather than the profile's existing conversation.
+- If the MCP tool is unavailable, surface that the bridge server/browser may not
+  be running instead of retrying blindly.
+- Do not relay ChatGPT verbatim without analysis; engage critically with it.
