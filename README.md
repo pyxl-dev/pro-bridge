@@ -14,39 +14,54 @@ The MCP server exposes three tools:
 
 | Tool | Purpose |
 |---|---|
-| `chatgpt_ask(prompt, session?, conversation_id?)` | Ask ChatGPT. A named session automatically resumes its own mapped ChatGPT thread. |
-| `chatgpt_new_chat(session?)` | Reset one named session so its next message starts a new ChatGPT thread. |
-| `chatgpt_status(session?)` | Check browser state and optionally inspect the conversation mapped to one session. |
+| `chatgpt_ask(prompt, session?, conversation_id?)` | Ask ChatGPT. Hermes profiles are automatically routed to their own persistent ChatGPT thread. |
+| `chatgpt_new_chat(session?)` | Detach the caller profile from its current thread so its next message starts fresh. |
+| `chatgpt_status(session?)` | Check browser state and the caller profile's mapped conversation. |
 
 File upload and image generation are intentionally left for the next milestone.
 
-## Named sessions for Hermes agents
+## Automatic Hermes profile sessions
 
-The recommended multi-agent contract is to use the **stable Hermes profile/bot
-name** as `session`.
+Hermes can attach its active profile name to every HTTP MCP request with an
+`identity_header` configuration. `pro-bridge` reads that header directly from
+the MCP request context, so the model does **not** need to know, remember, or
+pass its own session name.
 
-Example:
+Recommended Hermes configuration:
 
-```text
-chatgpt_ask(
-  prompt="Analyse ce bug et propose un correctif.",
-  session="developer"
-)
+```json
+{
+  "mcpServers": {
+    "chatgpt-web": {
+      "url": "http://127.0.0.1:8765/mcp",
+      "identity_header": {
+        "name": "X-Hermes-Profile",
+        "value_from": "profile"
+      }
+    }
+  }
+}
 ```
 
-First call for `developer`:
+If the active Hermes profile is `developer`, Hermes sends:
+
+```text
+X-Hermes-Profile: developer
+```
+
+The bridge then resolves:
 
 ```text
 developer -> no mapping yet -> NEW ChatGPT conversation -> id AAA
 ```
 
-Later calls:
+Later tool calls from the same Hermes profile automatically resolve:
 
 ```text
 developer -> AAA -> continue the same ChatGPT conversation
 ```
 
-Another profile stays isolated:
+A different profile remains isolated:
 
 ```text
 business -> NEW ChatGPT conversation -> id BBB
@@ -60,33 +75,30 @@ The mapping is persisted by default in:
 
 so continuity survives Hermes and bridge restarts.
 
-To deliberately start a new topic for one profile:
+To deliberately start a new topic, the agent only needs to call:
 
 ```text
-chatgpt_new_chat(session="developer")
+chatgpt_new_chat()
 ```
 
-This **does not delete** the previous ChatGPT conversation. It only removes the
-`developer -> AAA` mapping. The next `chatgpt_ask(..., session="developer")`
-creates a fresh ChatGPT conversation and stores the new id automatically.
+The caller is identified from `X-Hermes-Profile`, so only that profile's mapping
+is reset. The previous ChatGPT conversation is **not deleted**; it is simply no
+longer attached to that Hermes profile. Its next `chatgpt_ask(...)` creates a
+fresh ChatGPT conversation and stores the new id automatically.
 
-### Advanced/manual conversation id
+### Manual fallback / advanced override
 
-`conversation_id` remains available as an override:
+The `session` argument remains available for MCP clients that do not send an
+identity header. When `X-Hermes-Profile` is present, the header always wins over
+the explicit argument; this prevents an LLM from accidentally routing itself
+into another agent's thread.
 
-```text
-chatgpt_ask(
-  prompt="Continue ce thread précis.",
-  session="developer",
-  conversation_id="6a95826b-..."
-)
-```
+`conversation_id` remains an advanced manual override for continuing a specific
+ChatGPT thread. If a caller profile is resolved, a successful explicit
+continuation rebinds that profile to the resulting conversation id.
 
-After a successful answer, `developer` becomes mapped to that explicit
-conversation id.
-
-If neither `session` nor `conversation_id` is passed, the bridge keeps the old
-stateless behavior: every call starts a new ChatGPT conversation.
+If no profile header, `session`, or `conversation_id` is available, the bridge
+keeps stateless behavior: every call starts a new ChatGPT conversation.
 
 ## Why this fork differs from upstream
 
@@ -94,7 +106,8 @@ The original project was centered on GPT Pro. This fork generalizes the bridge
 for ordinary ChatGPT usage:
 
 - no GPT Pro requirement or strict-model rejection;
-- named persistent `session -> conversation_id` routing for multi-agent Hermes;
+- automatic Hermes profile identity via HTTP MCP header;
+- persistent `profile -> conversation_id` routing for multi-agent Hermes;
 - `conversation_id=None` starts a new conversation when no named mapping exists;
 - browser actions are serialized so multiple agents cannot type into the same
   composer simultaneously;
@@ -109,23 +122,22 @@ for ordinary ChatGPT usage:
 ## Architecture
 
 ```text
-Hermes agents
- developer ─┐
- business  ─┼─ session names
- research  ─┘
-        |
-        | Streamable HTTP MCP
-        v
-   pro-bridge
-   session registry
-        |
-        | Playwright over CDP
-        v
-Chrome / Brave / Edge
-(dedicated authenticated profile)
-        |
-        v
-      ChatGPT
+Hermes profile: developer ─┐
+Hermes profile: business  ─┼─ X-Hermes-Profile
+Hermes profile: research  ─┘
+             |
+             | Streamable HTTP MCP
+             v
+        pro-bridge
+   persistent session registry
+             |
+             | Playwright over CDP
+             v
+     Chrome / Brave / Edge
+ (dedicated authenticated profile)
+             |
+             v
+           ChatGPT
 ```
 
 ## Quick start
@@ -180,33 +192,6 @@ python -m pro_bridge.server
 # http://127.0.0.1:8765/mcp by default
 ```
 
-## Hermes MCP configuration
-
-For Hermes installations using JSON MCP config:
-
-```json
-{
-  "mcpServers": {
-    "chatgpt-web": {
-      "url": "http://127.0.0.1:8765/mcp"
-    }
-  }
-}
-```
-
-Each Hermes profile should pass its own stable profile/bot name as the `session`
-argument whenever it uses `chatgpt_ask`, `chatgpt_new_chat`, or session-specific
-`chatgpt_status`.
-
-A useful agent instruction is:
-
-```text
-When using chatgpt-web, always pass your own stable Hermes profile name as
-`session`. Reuse that session for the same topic. When a genuinely new topic
-needs a clean ChatGPT context, call chatgpt_new_chat with that same session
-before the next chatgpt_ask.
-```
-
 ## Configuration
 
 | Variable | Default | Meaning |
@@ -215,8 +200,9 @@ before the next chatgpt_ask.
 | `CHATGPT_BRIDGE_HOST` | `127.0.0.1` | MCP bind address |
 | `CHATGPT_BRIDGE_PORT` | `8765` | MCP port |
 | `CHATGPT_BRIDGE_TOKEN` | _(none)_ | optional bearer token |
+| `CHATGPT_BRIDGE_IDENTITY_HEADER` | `X-Hermes-Profile` | HTTP header containing caller profile identity |
 | `CHATGPT_MODEL_SLUG` | _(empty)_ | optional model slug for new chats |
-| `CHATGPT_BRIDGE_SESSION_FILE` | `~/.pro-bridge/sessions.json` | persistent named-session registry |
+| `CHATGPT_BRIDGE_SESSION_FILE` | `~/.pro-bridge/sessions.json` | persistent profile/session registry |
 | `CHATGPT_BRIDGE_TIMEOUT` | `1800` | max seconds per answer |
 
 Legacy `PRO_BRIDGE_*`, `PRO_BRIDGE_TIMEOUT`, and `GPT_PRO_MODEL_SLUG` variables
@@ -225,13 +211,14 @@ are accepted as fallbacks.
 ## Concurrency
 
 The browser is a single mutable UI. The bridge serializes calls with locks so
-separate Hermes agents cannot navigate/type over one another. Named sessions
+separate Hermes agents cannot navigate/type over one another. Profile sessions
 provide logical conversation isolation; calls are still executed sequentially
 through the single browser worker.
 
 ## Diagnostics
 
 ```bash
+python -m unittest discover -s tests
 python selftest.py
 python debug_ask.py "Reply with one word: PONG"
 python probe_dom.py
@@ -253,6 +240,8 @@ python probe_dom.py
   ChatGPT session.
 - Keep the MCP server on localhost unless remote access is genuinely needed.
 - If remote access is needed, use a private network plus a bearer token.
+- Treat identity headers as routing hints, not authentication. For remote access,
+  protect the bridge separately with its bearer token/private network.
 - UI automation can break when ChatGPT changes its frontend; semantic selectors
   are intentionally kept few and centralized in `pro_bridge/chatgpt.py`.
 - This is an independent project and is not affiliated with OpenAI.
