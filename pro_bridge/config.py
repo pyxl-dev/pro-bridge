@@ -21,6 +21,11 @@ def _env(primary, legacy, default=""):
     return os.environ.get(primary, os.environ.get(legacy, default))
 
 
+def _env_bool(primary, legacy, default="1"):
+    value = _env(primary, legacy, default).strip().lower()
+    return value not in {"0", "false", "no", "off"}
+
+
 _load_dotenv()
 
 # CDP endpoint of the debug browser — local to this machine, never exposed.
@@ -29,6 +34,26 @@ CDP_URL = _env(
     "PRO_BRIDGE_CDP_URL",
     "http://localhost:9222",
 )
+
+# Automatically relaunch the dedicated browser if a local CDP endpoint is down.
+# Remote CDP endpoints are never auto-started.
+AUTO_START_BROWSER = _env_bool(
+    "CHATGPT_BRIDGE_AUTO_START_BROWSER",
+    "PRO_BRIDGE_AUTO_START_BROWSER",
+    "1",
+)
+BROWSER_START_TIMEOUT = float(
+    _env(
+        "CHATGPT_BRIDGE_BROWSER_START_TIMEOUT",
+        "PRO_BRIDGE_BROWSER_START_TIMEOUT",
+        "20",
+    )
+)
+BROWSER_START_COMMAND = _env(
+    "CHATGPT_BRIDGE_BROWSER_START_COMMAND",
+    "PRO_BRIDGE_BROWSER_START_COMMAND",
+    "",
+).strip()
 
 # Where the MCP server listens.
 HOST = _env("CHATGPT_BRIDGE_HOST", "PRO_BRIDGE_HOST", "127.0.0.1")
