@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pro-bridge"
-version = "0.1.0"
-description = "Expose web-only GPT Pro (and any ChatGPT model) to MCP clients via your real, logged-in browser"
+version = "0.2.0"
+description = "Expose an authenticated ChatGPT web session to MCP clients via a real browser"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-keywords = ["mcp", "chatgpt", "gpt-pro", "playwright", "claude-code", "llm", "agent"]
+keywords = ["mcp", "chatgpt", "playwright", "hermes", "claude-code", "llm", "agent"]
 dependencies = [
     "playwright>=1.40",
     "mcp>=1.2",

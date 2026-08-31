@@ -1,241 +1,212 @@
-<div align="center">
+# pro-bridge — ChatGPT Web as an MCP tool
 
-<img src="assets/logo.svg" alt="pro-bridge" width="100%">
+`pro-bridge` exposes the normal **ChatGPT web app** to Hermes and other MCP
+clients through a real browser session you are already logged into.
 
-<p>
-  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
-  <img alt="Python 3.10+" src="https://img.shields.io/badge/python-3.10%2B-3776ab?logo=python&logoColor=white">
-  <img alt="Protocol: MCP" src="https://img.shields.io/badge/protocol-MCP-8a2be2">
-  <img alt="Automation: Playwright" src="https://img.shields.io/badge/automation-Playwright-2ead33?logo=playwright&logoColor=white">
-  <img alt="PRs welcome" src="https://img.shields.io/badge/PRs-welcome-brightgreen">
-  <a href="https://github.com/alubato0127/pro-bridge/stargazers"><img alt="Stars" src="https://img.shields.io/github/stars/alubato0127/pro-bridge?style=social"></a>
-</p>
+It does not use the OpenAI API and does not depend on a particular ChatGPT
+model. The bridge drives `chatgpt.com` over Chrome DevTools Protocol (CDP),
+waits for the visible assistant turn to finish, and returns the reply together
+with its `conversation_id`.
 
-<strong>Expose web-only GPT&nbsp;Pro — and any ChatGPT model — to any MCP client, through your real, logged-in browser.</strong>
+## Current V1
 
-<sub>Let Claude Code (or Cursor, or any MCP host) consult, debate, and collaborate with a model that has no API.</sub>
+The MCP server exposes three tools:
 
-</div>
+| Tool | Purpose |
+|---|---|
+| `chatgpt_ask(prompt, conversation_id?)` | Ask ChatGPT. No id = **new chat**; passing an id continues that exact thread. |
+| `chatgpt_new_chat()` | Explicitly navigate the bridge browser to a fresh chat. |
+| `chatgpt_status()` | Check browser connection, current URL, model (when known), and conversation id. |
 
----
+File upload and image generation are intentionally left for the next milestone,
+after the text round-trip is validated against the current ChatGPT UI.
 
-GPT&nbsp;Pro is one of the strongest reasoning models available — but it lives
-**only in the ChatGPT web app**. No API, no SDK, no CLI. `pro-bridge` closes that
-gap: it drives a model you're already paying for from your coding agent, so you
-can bring the heavy artillery into an automated debate or a hard design review
-without copy-pasting between windows.
+## Why this fork differs from upstream
 
-It does this **without** a brittle scraper or a reverse-engineered private API.
-It attaches to your **real** browser session over the Chrome DevTools Protocol,
-so the genuine page handles login, cookies, and anti-bot tokens — and reads
-answers from semantic DOM anchors that survive UI redesigns.
+The original project was centered on GPT Pro. This fork generalizes the bridge
+for ordinary ChatGPT usage:
 
-## Table of contents
+- no GPT Pro requirement or strict-model rejection;
+- no model-specific MCP tool name;
+- `conversation_id=None` now **always starts a new conversation** instead of
+  accidentally reusing whichever `/c/...` tab happened to be open;
+- browser actions remain serialized with a lock so multiple agents cannot type
+  into the composer at the same time;
+- completion detection combines the latest turn's Copy action, visible Stop
+  state, and conservative text stability;
+- timeouts now fail explicitly instead of returning a potentially partial
+  answer;
+- generic `CHATGPT_BRIDGE_*` configuration names, with legacy upstream names
+  still accepted.
 
-- [Features](#features)
-- [How it works](#how-it-works)
-- [Quickstart](#quickstart)
-- [Topologies](#topologies)
-- [Configuration](#configuration)
-- [Use it in Claude Code](#use-it-in-claude-code)
-- [How it stays robust](#how-it-stays-robust)
-- [Troubleshooting](#troubleshooting)
-- [Roadmap](#roadmap)
-- [Contributing](#contributing)
-- [Disclaimer](#disclaimer)
-- [License](#license)
+## Architecture
 
-## Features
-
-- 🌉 **Reach web-only models** — GPT&nbsp;Pro and any model in your ChatGPT account, exposed as a clean MCP tool: `ask_gpt_pro(prompt, conversation_id?)`.
-- 🔌 **Real session, no login flow** — attaches to your existing logged-in Chrome via CDP. Your genuine browser computes cookies and proof-of-work tokens, so detection surface is minimal and there's nothing to log in to.
-- 🛡️ **Model verification** — reads the model that actually produced each answer (`data-message-model-slug`) and refuses anything that isn't a Pro model, so you never silently get a downgrade.
-- 🧱 **Built to not break** — answers are read from semantic attributes + a text-stability check, not fragile CSS classes or the ever-changing SSE delta protocol. Only ~4 selectors couple to the UI, all documented.
-- 🌐 **Any topology** — same machine (localhost) or client-on-a-headless-server + browser-on-your-laptop (over LAN/Tailscale). Same code, just a different URL.
-- 💻 **Cross-platform host** — launch scripts for Windows, macOS, and Linux (Chrome / Chromium / Brave / Edge).
-- 🔐 **Private by default** — bind to localhost, or put it behind a bearer token on a private network.
-- 💬 **Batteries included** — ships with a `/debate-high` slash command that runs a structured Claude-vs-Pro debate.
-
-## How it works
-
-The browser automation stays on the machine that has the browser; only the MCP
-request/reply travels — and on a single machine, nothing leaves it at all.
-
-```mermaid
-flowchart LR
-    subgraph host["💻 machine with the browser"]
-        B["Chrome / Chromium<br/>(logged in, --remote-debugging-port)"]
-        P["pro-bridge<br/>FastMCP server"]
-        P -- "CDP · localhost" --> B
-    end
-    subgraph client["🤖 MCP client (any OS)"]
-        CC["Claude Code · Cursor · …<br/>/debate-high"]
-    end
-    CC -- "streamable-HTTP MCP<br/>(localhost or LAN/Tailscale)" --> P
-    B -- "your real session" --> G["🌐 ChatGPT · GPT&nbsp;Pro"]
+```text
+Hermes / MCP client
+        |
+        | Streamable HTTP MCP
+        v
+   pro-bridge
+        |
+        | Playwright over CDP
+        v
+Chrome / Brave / Edge
+(logged into chatgpt.com)
+        |
+        v
+      ChatGPT
 ```
 
-1. Your agent calls the `ask_gpt_pro` MCP tool with a self-contained prompt.
-2. pro-bridge types it into the live ChatGPT composer and submits.
-3. It waits for generation to finish (Pro reasons for minutes) and extracts the answer.
-4. It verifies the answer came from a Pro model and returns `{text, model, conversation_id}`.
-5. Pass `conversation_id` back to continue the same thread — that's what makes multi-round debate work.
+The browser should be a dedicated profile. Login, cookies, challenges, and the
+normal ChatGPT frontend remain handled by the real browser.
 
-## Quickstart
+## Quick start
 
-> Runs on the machine with the browser. Python 3.10+. No `playwright install`
-> needed — it attaches to your existing browser.
+Python 3.10+ is required.
 
 ```bash
-git clone https://github.com/alubato0127/pro-bridge
+git clone https://github.com/pyxl-dev/pro-bridge
 cd pro-bridge
 pip install -r requirements.txt
-cp .env.example .env          # edit: set a token (or leave localhost-only)
+cp .env.example .env
 ```
 
-**1. Start the bridge browser** (log in once; the profile persists):
+Start the dedicated debug browser:
 
 ```powershell
 # Windows
 powershell -ExecutionPolicy Bypass -File scripts\start-chrome-debug.ps1
 ```
+
 ```bash
-# macOS / Linux  (auto-detects chrome/chromium/brave/edge; override with BROWSER=)
+# macOS / Linux — auto-detects Chrome/Chromium/Brave/Edge
 ./scripts/start-chrome-debug.sh
 ```
 
-In the window that opens, log into chatgpt.com and select your Pro model. Leave
-it open (minimizing is fine).
+Log into `chatgpt.com` in that browser once and leave the browser open.
 
-**2. Sanity-check the connection** (sends nothing):
+Check the connection without sending anything:
 
 ```bash
 python selftest.py
-# or a full round-trip (slow — Pro thinks for minutes):
+```
+
+Full text round-trip:
+
+```bash
 python selftest.py "Reply with exactly one word: PONG"
 ```
 
-**3. Run the server:**
+Start the MCP server:
 
 ```bash
-python -m pro_bridge.server     # serves http://<host>:8765/mcp
+python -m pro_bridge.server
+# http://127.0.0.1:8765/mcp by default
 ```
 
-Then [wire it into your client](#use-it-in-claude-code) — a **one-time** step.
+## Hermes
 
-> **After a reboot** you only need to bring the bridge back up; the client
-> registration persists. Use the one-shot launcher:
-> ```powershell
-> powershell -ExecutionPolicy Bypass -File scripts\start-all.ps1   # Windows
-> ```
-> ```bash
-> ./scripts/start-all.sh                                           # macOS / Linux
-> ```
-> To make it fully hands-off, add that launcher to your OS startup items
-> (Windows Task Scheduler "at log on", or a macOS/Linux login item).
+Hermes supports HTTP MCP servers natively. A minimal local configuration is:
 
-## Topologies
+```yaml
+mcp_servers:
+  chatgpt_web:
+    url: "http://127.0.0.1:8765/mcp"
+```
 
-pro-bridge is network-transparent — run it wherever the logged-in browser is and
-point your client at it. Same code in every case; only the URL changes.
+If the bridge is on another machine, bind it to a private interface/network,
+set `CHATGPT_BRIDGE_TOKEN`, and send the matching bearer token in the MCP
+headers.
 
-| Client (Claude Code, …) | Browser host | `PRO_BRIDGE_HOST` | Client connects to |
-|---|---|---|---|
-| **Same machine** as the browser | same | `127.0.0.1` | `http://localhost:8765/mcp` |
-| **Different machine** (e.g. headless server) | your laptop/desktop | `0.0.0.0` | `http://<host-LAN/Tailscale-IP>:8765/mcp` |
+The important tool contract for orchestration is:
 
-The browser host can be **Windows, macOS, or Linux**. The client can be any
-MCP-capable tool on any OS. Same-machine? Skip the token (localhost only).
-Cross-machine? Keep a token and put it behind a private network like Tailscale.
+```text
+chatgpt_ask(prompt)
+  -> {text, model, conversation_id}
+
+chatgpt_ask(follow_up, conversation_id=<previous id>)
+  -> same ChatGPT thread
+```
+
+Each no-id call starts a fresh ChatGPT conversation. This makes the bridge safe
+to use from an orchestrator that may maintain several independent ChatGPT
+threads.
 
 ## Configuration
 
-All via environment / `.env`:
-
 | Variable | Default | Meaning |
 |---|---|---|
-| `PRO_BRIDGE_CDP_URL` | `http://localhost:9222` | CDP endpoint of the debug browser (local) |
-| `PRO_BRIDGE_HOST` | `127.0.0.1` | bind address — `0.0.0.0` to expose across machines |
-| `PRO_BRIDGE_PORT` | `8765` | MCP server port |
-| `PRO_BRIDGE_TOKEN` | _(none)_ | if set, callers must send `Authorization: Bearer <token>` |
-| `GPT_PRO_MODEL_SLUG` | _(current)_ | force a model on new chats (e.g. `gpt-5-pro`); empty = use selected |
-| `PRO_BRIDGE_STRICT_MODEL` | `1` | refuse answers if the active model isn't a Pro model |
-| `PRO_BRIDGE_TIMEOUT` | `1800` | max seconds to wait for one answer (Pro is slow) |
+| `CHATGPT_BRIDGE_CDP_URL` | `http://localhost:9222` | CDP endpoint |
+| `CHATGPT_BRIDGE_HOST` | `127.0.0.1` | MCP bind address |
+| `CHATGPT_BRIDGE_PORT` | `8765` | MCP port |
+| `CHATGPT_BRIDGE_TOKEN` | _(none)_ | optional bearer token |
+| `CHATGPT_MODEL_SLUG` | _(empty)_ | optional model slug for new chats |
+| `CHATGPT_BRIDGE_TIMEOUT` | `1800` | max seconds per answer |
 
-## Use it in Claude Code
+Legacy `PRO_BRIDGE_*`, `PRO_BRIDGE_TIMEOUT`, and `GPT_PRO_MODEL_SLUG` variables
+are accepted as fallbacks so existing upstream launch scripts/configurations do
+not break immediately.
 
-**Same machine** (simplest — no token):
+## Completion and response extraction
+
+The bridge deliberately avoids parsing ChatGPT's private streaming protocol.
+
+It waits for a new semantic assistant turn:
+
+```css
+[data-message-author-role="assistant"]
+```
+
+Then it extracts rendered `.markdown` when available, falling back to the full
+assistant turn.
+
+Completion uses two paths:
+
+1. **High confidence:** the latest conversation turn exposes
+   `copy-turn-action-button` and the answer text is stable.
+2. **UI-drift fallback:** no visible Stop control and the answer text remains
+   unchanged for roughly 15 seconds.
+
+If neither condition is reached before the configured timeout, the call raises a
+timeout error rather than silently returning partial output.
+
+## Multi-agent behavior
+
+The browser is a single mutable UI, so all bridge operations are guarded by an
+`asyncio.Lock`.
+
+That means Hermes can issue calls from different agents without prompt text
+interleaving. They are executed sequentially, while each agent can preserve its
+own ChatGPT context by keeping the returned `conversation_id`.
+
+## Diagnostics
+
 ```bash
-claude mcp add --transport http gpt-pro http://localhost:8765/mcp --scope user
+python selftest.py
+python debug_ask.py "Reply with one word: PONG"
+python probe_dom.py
 ```
 
-**Different machine** (client on a server, browser on your laptop):
-```bash
-claude mcp add --transport http gpt-pro \
-  http://<browser-host-ip>:8765/mcp --scope user \
-  --header "Authorization: Bearer <PRO_BRIDGE_TOKEN>"
-```
+`probe_dom.py` sends nothing and is useful when ChatGPT changes DOM attributes.
 
-The tool shows up as `mcp__gpt-pro__ask_gpt_pro`. Drop
-[`commands/debate-high.md`](commands/debate-high.md) into your
-`~/.claude/commands/` to get a `/debate-high` command that runs a structured
-Claude-vs-Pro debate:
+## Next milestone
 
-```
-/debate-high Should this RL reward use potential-based shaping or a raw bonus?
-```
+- [ ] upload files through the hidden `input[type=file]`;
+- [ ] generate images through ChatGPT and download the resulting file;
+- [ ] optional reference-image support;
+- [ ] automated DOM smoke test / CI fixtures;
+- [ ] improve multi-tab isolation if parallel browser workers are later needed.
 
-## How it stays robust
+## Security and operational notes
 
-The two design decisions that keep this from rotting like a typical scraper:
-
-| Failure mode of naive scrapers | What pro-bridge does instead |
-|---|---|
-| Bot detection / login walls | Attaches to your **real** logged-in browser (CDP); the genuine page produces cookies and anti-bot tokens |
-| Reading the answer off fragile CSS classes | Reads the assistant turn by its **semantic attribute** (`data-message-author-role`) + a text-stability settle |
-| Parsing the volatile streaming/delta protocol | Doesn't — waits for the stop indicator to clear and the text to stop changing |
-| Silently getting a weaker model | **Verifies** the producing model from `data-message-model-slug`; refuses non-Pro |
-| Guessing completion of a long "thinking" turn | Pure polling with a generous timeout — no single locator wait that can hang |
-
-When ChatGPT does redesign, only a handful of selectors in
-[`pro_bridge/chatgpt.py`](pro_bridge/chatgpt.py) need a touch — the bundled
-`probe_dom.py` / `debug_ask.py` tools locate the new ones in seconds.
-
-## Troubleshooting
-
-| Symptom | Fix |
-|---|---|
-| `selftest.py` can't connect | Browser isn't running with `--remote-debugging-port`, or wrong `PRO_BRIDGE_CDP_URL`. Re-run the launch script. |
-| `421 Invalid Host header` | MCP DNS-rebinding guard — already disabled in `server.py`; make sure you're on the latest version. |
-| Health check `Failed to connect` from a remote client | Check the host firewall / Tailscale ACL, and that `PRO_BRIDGE_HOST=0.0.0.0`. |
-| "Refusing answer: … not a Pro model" | Select GPT Pro in the bridge browser, or set `GPT_PRO_MODEL_SLUG`. |
-| Model slug changed after a ChatGPT update | Run `python selftest.py` — it logs the live slug — and update `.env`. |
-| Selectors broke after a redesign | Run `python probe_dom.py`, paste output, update the few selectors in `chatgpt.py`. |
-
-## Roadmap
-
-- [ ] Multiple model tools in one server (`ask_gpt_pro`, `ask_gpt_thinking`, …)
-- [ ] Adapters for other web-only models (Gemini Ultra, Grok, …)
-- [ ] Streaming partial responses back to the client
-- [ ] A three-way orchestrator (Claude ⇄ Codex ⇄ GPT Pro round-table)
-- [ ] One-command installer / packaged service
-
-Contributions toward any of these are very welcome.
-
-## Contributing
-
-Issues and PRs welcome. The codebase is small and readable —
-`pro_bridge/chatgpt.py` is the browser driver, `pro_bridge/server.py` is the MCP
-server, and the `probe_*` / `debug_*` scripts help when the UI shifts. Please
-keep the "don't couple to fragile UI" principle when adding selectors.
-
-## Disclaimer
-
-This automates the ChatGPT web UI of **your own** account. That's a gray area
-under OpenAI's terms of service — **use at your own risk**. It is not affiliated
-with, endorsed by, or sponsored by OpenAI or Anthropic. "GPT", "ChatGPT", and
-"Claude" are trademarks of their respective owners.
+- Keep the debug browser profile private: it contains an authenticated ChatGPT
+  session.
+- Keep the MCP server on localhost unless remote access is genuinely needed.
+- If remote access is needed, use a private network plus a bearer token.
+- UI automation can break when ChatGPT changes its frontend; the semantic
+  selectors are intentionally kept few and centralized in `pro_bridge/chatgpt.py`.
+- This is an independent project and is not affiliated with OpenAI.
 
 ## License
 
-[MIT](LICENSE) © 2026 Kuanyen Liu
+MIT.
