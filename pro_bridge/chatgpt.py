@@ -30,6 +30,39 @@ class ChatGPTDriver:
         # each other's conversations.
         self._lock = asyncio.Lock()
 
+    @staticmethod
+    def _is_driver_connection_error(exc: BaseException) -> bool:
+        """Return True only for loss of the Playwright driver transport.
+
+        Browser/page closures are deliberately not treated as this condition:
+        after a prompt has been sent we must never blindly resend it. The known
+        failure we can recover safely is the Python <-> Playwright driver pipe
+        disappearing while the real CDP browser remains alive.
+        """
+        message = str(exc).lower()
+        return "connection closed while reading from the driver" in message
+
+    @staticmethod
+    def _conversation_id_from_url(url: str | None) -> str | None:
+        if not url:
+            return None
+        match = CONV_RE.search(url)
+        return match.group(1) if match else None
+
+    async def _discard_playwright_driver(self):
+        """Drop a dead Playwright transport without closing the real browser."""
+        old_pw = self._pw
+        self._pw = None
+        self._browser = None
+        if old_pw is None:
+            return
+        try:
+            # A dead driver normally fails immediately. Bound stop() anyway so a
+            # broken transport cannot stall the recovery path.
+            await asyncio.wait_for(old_pw.stop(), timeout=2.0)
+        except Exception:
+            pass
+
     async def _ensure(self):
         if self._browser is not None and self._browser.is_connected():
             return
@@ -117,6 +150,35 @@ class ChatGPTDriver:
 
         return page
 
+    async def _recover_inflight_page(self, conversation_id: str | None):
+        """Reattach Playwright to an already-sent ChatGPT request.
+
+        This method never sends a prompt. If the conversation id was not known
+        yet (typical immediately after a brand-new chat), recovery is accepted
+        only when the reattached ChatGPT page itself has a /c/<uuid> URL. This is
+        intentionally fail-closed to avoid duplicating a prompt in another chat.
+        """
+        log.warning(
+            "Playwright driver transport was lost after prompt send; "
+            "reattaching to CDP without resending"
+        )
+        await self._discard_playwright_driver()
+        await self._ensure()
+
+        if conversation_id:
+            page = await self._get_page(conversation_id)
+            return page, conversation_id
+
+        page = await self._chatgpt_page()
+        recovered_id = self._conversation_id_from_url(page.url)
+        if not recovered_id:
+            raise RuntimeError(
+                "Playwright driver disconnected after the prompt was sent, but "
+                "the active ChatGPT conversation could not be identified safely. "
+                "The prompt was not resent."
+            )
+        return page, recovered_id
+
     async def _last_assistant_slug(self, page):
         # Ground truth when available: assistant turns carry the model slug that
         # produced them. The attribute is not guaranteed, so absence is allowed.
@@ -137,10 +199,7 @@ class ChatGPTDriver:
     async def status(self):
         async with self._lock:
             page = await self._get_page()
-            conv = None
-            match = CONV_RE.search(page.url)
-            if match:
-                conv = match.group(1)
+            conv = self._conversation_id_from_url(page.url)
             return {
                 "connected": True,
                 "url": page.url,
@@ -178,26 +237,29 @@ class ChatGPTDriver:
                     # depend on ChatGPT's private API response format.
                     pass
 
+            listener_page = page
             page.on("request", on_request)
             try:
                 before = await page.locator(ASSISTANT).count()
+                # Recovery below begins only after _send() has returned. If the
+                # driver dies during send itself we fail closed, because we cannot
+                # know whether ChatGPT received the prompt and must not duplicate it.
                 await self._send(page, prompt)
-                await page.wait_for_function(
-                    "n => document.querySelectorAll"
-                    "('[data-message-author-role=assistant]').length > n",
-                    arg=before,
-                    timeout=config.ANSWER_TIMEOUT * 1000,
+                deadline = time.monotonic() + config.ANSWER_TIMEOUT
+                page, text, conv = await self._wait_for_answer(
+                    page,
+                    before,
+                    conversation_id=conversation_id,
+                    deadline=deadline,
                 )
-                await self._wait_complete(page)
-                text = await self._extract_answer(page)
             finally:
-                page.remove_listener("request", on_request)
+                try:
+                    listener_page.remove_listener("request", on_request)
+                except Exception:
+                    pass
 
             model = await self._last_assistant_slug(page) or model_holder.get("model")
-            conv = None
-            match = CONV_RE.search(page.url)
-            if match:
-                conv = match.group(1)
+            conv = conv or self._conversation_id_from_url(page.url)
 
             if not conv:
                 raise RuntimeError(
@@ -217,8 +279,9 @@ class ChatGPTDriver:
                 text = (await md.last.inner_text()).strip()
                 if text:
                     return text
-        except Exception:
-            pass
+        except Exception as exc:
+            if self._is_driver_connection_error(exc):
+                raise
 
         text = (await loc.inner_text()).strip()
         if not text:
@@ -304,44 +367,83 @@ class ChatGPTDriver:
                     };
                 }"""
             )
-        except Exception:
+        except Exception as exc:
+            if self._is_driver_connection_error(exc):
+                raise
             return {"copyVisible": False, "stopVisible": False}
 
-    async def _wait_complete(self, page):
-        """Wait until the latest answer has genuinely settled.
+    async def _wait_for_answer(
+        self,
+        page,
+        before: int,
+        *,
+        conversation_id: str | None,
+        deadline: float,
+    ):
+        """Wait for one new complete assistant turn under a single time budget.
 
-        Fast path: latest turn exposes its Copy action and text is stable.
-        Fallback: no visible Stop control and text is stable for ~15 seconds.
-        The fallback is deliberately conservative to avoid returning a temporary
-        thinking/tool summary as the final answer.
+        Unlike page.wait_for_function(), polling uses short Playwright RPCs so a
+        dead driver transport is detected and recovered promptly. The prompt has
+        already been sent when this method runs; recovery therefore only
+        reattaches to the existing conversation and never calls _send().
         """
-        deadline = time.time() + config.ANSWER_TIMEOUT
-        last = None
-        stable = 0
+        active_conversation = conversation_id
+        recovered_driver = False
+        last_text = None
+        stable_since = None
 
-        while time.time() < deadline:
+        while time.monotonic() < deadline:
             try:
-                current = await self._extract_answer(page)
-            except Exception:
-                current = None
+                if active_conversation is None:
+                    active_conversation = self._conversation_id_from_url(page.url)
 
-            state = await self._completion_state(page)
+                count = await page.locator(ASSISTANT).count()
+                if count <= before:
+                    await asyncio.sleep(0.75)
+                    continue
 
-            if current and current == last:
-                stable += 1
-            else:
-                last = current
-                stable = 0
+                try:
+                    current = await self._extract_answer(page)
+                except RuntimeError as exc:
+                    if self._is_driver_connection_error(exc):
+                        raise
+                    current = None
 
-            if current and state["copyVisible"] and stable >= 1:
-                return
+                state = await self._completion_state(page)
+                now = time.monotonic()
 
-            # UI-drift fallback: ~15 seconds of unchanged text while no visible
-            # stop button exists.
-            if current and not state["stopVisible"] and stable >= 10:
-                return
+                if current:
+                    if current != last_text:
+                        last_text = current
+                        stable_since = now
 
-            await asyncio.sleep(1.5)
+                    # Copy is the strongest available UI completion signal and
+                    # is only exposed for a completed assistant turn.
+                    if state["copyVisible"]:
+                        return page, current, active_conversation
+
+                    # DOM-drift fallback: unchanged text for 15 seconds with no
+                    # visible Stop control. Use elapsed time rather than polling
+                    # counts so scheduling jitter cannot shorten this guard.
+                    if (
+                        not state["stopVisible"]
+                        and stable_since is not None
+                        and now - stable_since >= 15.0
+                    ):
+                        return page, current, active_conversation
+
+                await asyncio.sleep(0.75)
+            except Exception as exc:
+                if recovered_driver or not self._is_driver_connection_error(exc):
+                    raise
+                recovered_driver = True
+                page, recovered_id = await self._recover_inflight_page(
+                    active_conversation
+                )
+                active_conversation = recovered_id
+                # The same ChatGPT DOM remains authoritative. Preserve `before`
+                # and stability state; only the Playwright transport changed.
+                continue
 
         raise TimeoutError(
             f"ChatGPT response did not complete within {config.ANSWER_TIMEOUT} seconds."
@@ -354,3 +456,6 @@ class ChatGPTDriver:
                 await self._pw.stop()
         except Exception:
             pass
+        finally:
+            self._pw = None
+            self._browser = None
