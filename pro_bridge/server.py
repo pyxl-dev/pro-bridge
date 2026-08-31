@@ -3,12 +3,13 @@ import asyncio
 import logging
 
 import uvicorn
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
 from . import config
 from .chatgpt import ChatGPTDriver
+from .identity import resolve_session
 from .sessions import SessionStore
 
 logging.basicConfig(
@@ -45,53 +46,75 @@ _sessions = SessionStore(config.SESSION_FILE)
 _session_lock = asyncio.Lock()
 
 
+def _effective_session(session: str | None, ctx: Context) -> tuple[str | None, str]:
+    """Resolve caller identity from Hermes HTTP header, then argument fallback."""
+    resolved, source = resolve_session(session, ctx, config.IDENTITY_HEADER)
+    if source == "header" and session and session.strip() != resolved:
+        log.warning(
+            "Ignoring explicit session=%r because %s identifies caller as %r",
+            session,
+            config.IDENTITY_HEADER,
+            resolved,
+        )
+    return resolved, source
+
+
 @mcp.tool()
 async def chatgpt_ask(
     prompt: str,
+    ctx: Context,
     session: str | None = None,
     conversation_id: str | None = None,
 ) -> dict:
     """Ask ChatGPT through the logged-in web UI and return the complete reply.
 
-    Recommended multi-agent usage: pass a stable `session` name for the caller
-    (for example the Hermes profile name). The bridge remembers the ChatGPT
-    conversation id for that session and automatically resumes it on later
-    calls. If the session has no mapping yet, a new ChatGPT conversation is
-    created and then persisted.
+    With Hermes, caller identity is normally automatic: configure the MCP server
+    with an identity header sourced from the active Hermes profile. The bridge
+    reads that header and persistently maps the profile name to its own ChatGPT
+    conversation, so each Hermes profile keeps independent context without the
+    model having to pass a session name.
 
-    `conversation_id` remains available as an advanced/manual override. If both
-    `session` and `conversation_id` are supplied, that exact conversation is
-    continued and the session is rebound to it after a successful answer.
+    `session` is only a fallback for clients that do not send the identity
+    header. When the header is present it wins, preventing an agent from routing
+    itself into another profile's thread by passing the wrong session value.
 
-    If neither `session` nor `conversation_id` is supplied, every call starts a
-    new ChatGPT conversation (legacy/stateless behavior).
+    `conversation_id` remains an advanced/manual override. When a named profile
+    or fallback session is resolved, a successful explicit continuation rebinds
+    that session to the resulting conversation id.
 
-    Returns {text, model, conversation_id, session}.
+    If no profile header, session, or conversation_id is available, the call is
+    stateless and starts a new ChatGPT conversation.
+
+    Returns {text, model, conversation_id, session, session_source}.
     """
+    effective_session, session_source = _effective_session(session, ctx)
+
     async with _session_lock:
         mapped_conversation = None
-        if session:
-            mapped_conversation = _sessions.get(session)
+        if effective_session:
+            mapped_conversation = _sessions.get(effective_session)
 
         resolved_conversation = conversation_id or mapped_conversation
         log.info(
-            "chatgpt_ask: %d chars, session=%s, conv=%s%s",
+            "chatgpt_ask: %d chars, session=%s source=%s conv=%s%s",
             len(prompt),
-            session,
+            effective_session,
+            session_source,
             resolved_conversation,
             " (mapped)" if mapped_conversation and not conversation_id else "",
         )
 
         result = await _driver.ask(prompt, resolved_conversation)
 
-        if session:
-            _sessions.set(session, result["conversation_id"])
+        if effective_session:
+            _sessions.set(effective_session, result["conversation_id"])
 
-        result["session"] = session
+        result["session"] = effective_session
+        result["session_source"] = session_source
         log.info(
             "chatgpt_ask done: model=%s session=%s conv=%s, %d chars",
             result.get("model"),
-            session,
+            effective_session,
             result.get("conversation_id"),
             len(result.get("text", "")),
         )
@@ -99,42 +122,57 @@ async def chatgpt_ask(
 
 
 @mcp.tool()
-async def chatgpt_new_chat(session: str | None = None) -> dict:
-    """Start fresh, optionally resetting one named agent session.
+async def chatgpt_new_chat(
+    ctx: Context,
+    session: str | None = None,
+) -> dict:
+    """Detach the caller's current ChatGPT thread so the next ask starts fresh.
 
-    Pass the caller's stable `session` name to forget its previous ChatGPT
-    conversation. The old ChatGPT thread is not deleted; it is simply detached
-    from this session. The next `chatgpt_ask(..., session=...)` starts a new
-    conversation and stores its new id automatically.
+    Hermes profiles are identified automatically from the configured identity
+    header. Therefore a normal Hermes caller can invoke this tool with no
+    arguments and only its own profile mapping is reset.
 
-    With no session, this only navigates the bridge browser to ChatGPT's generic
-    new-chat page and does not alter any named mappings.
+    `session` is a fallback for clients without an identity header. The old
+    ChatGPT thread is not deleted; it is simply detached from the resolved
+    session. The next chatgpt_ask starts a new conversation and stores its id.
     """
+    effective_session, session_source = _effective_session(session, ctx)
+
     async with _session_lock:
-        previous = _sessions.reset(session) if session else None
+        previous = _sessions.reset(effective_session) if effective_session else None
         result = await _driver.new_chat()
         result.update(
             {
-                "session": session,
+                "session": effective_session,
+                "session_source": session_source,
                 "previous_conversation_id": previous,
-                "reset": bool(session),
+                "reset": bool(effective_session),
             }
         )
         log.info(
-            "chatgpt_new_chat: session=%s previous=%s",
-            session,
+            "chatgpt_new_chat: session=%s source=%s previous=%s",
+            effective_session,
+            session_source,
             previous,
         )
         return result
 
 
 @mcp.tool()
-async def chatgpt_status(session: str | None = None) -> dict:
-    """Return bridge status and, optionally, one named session's mapped chat id."""
+async def chatgpt_status(
+    ctx: Context,
+    session: str | None = None,
+) -> dict:
+    """Return bridge status and the caller profile's mapped ChatGPT thread."""
+    effective_session, session_source = _effective_session(session, ctx)
+
     async with _session_lock:
         result = await _driver.status()
-        result["session"] = session
-        result["session_conversation_id"] = _sessions.get(session) if session else None
+        result["session"] = effective_session
+        result["session_source"] = session_source
+        result["session_conversation_id"] = (
+            _sessions.get(effective_session) if effective_session else None
+        )
         result["session_count"] = len(_sessions.snapshot())
         return result
 
@@ -155,7 +193,8 @@ class RewriteHost:
 
     This keeps compatibility with MCP SDK versions whose DNS-rebinding guard
     does not accept private-network hostnames even when the bridge is protected
-    by a bearer token.
+    by a bearer token. All other request headers, including the Hermes profile
+    identity header, are preserved unchanged.
     """
 
     def __init__(self, app):
@@ -180,12 +219,13 @@ def main():
     app = RewriteHost(app)
     log.info(
         "ChatGPT web MCP listening on http://%s:%s/mcp "
-        "(token=%s, model_slug=%s, sessions=%s)",
+        "(token=%s, model_slug=%s, sessions=%s, identity_header=%s)",
         config.HOST,
         config.PORT,
         "set" if config.TOKEN else "NONE",
         config.MODEL_SLUG or "default/current",
         config.SESSION_FILE,
+        config.IDENTITY_HEADER,
     )
     uvicorn.run(app, host=config.HOST, port=config.PORT)
 
