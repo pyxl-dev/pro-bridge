@@ -1,5 +1,6 @@
 import asyncio
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from pro_bridge.browser_guard import (
@@ -34,6 +35,26 @@ class BrowserGuardTests(unittest.TestCase):
                 result = await launch_local_browser("http://10.0.0.8:9222")
                 self.assertFalse(result)
                 spawn.assert_not_awaited()
+
+        asyncio.run(run())
+
+    def test_local_launch_passes_configured_port_to_launcher(self):
+        async def run():
+            dummy_proc = SimpleNamespace(returncode=None)
+            with patch(
+                "pro_bridge.browser_guard._tcp_ready",
+                new=AsyncMock(side_effect=[False, True]),
+            ), patch(
+                "pro_bridge.browser_guard.asyncio.create_subprocess_exec",
+                new=AsyncMock(return_value=dummy_proc),
+            ) as spawn:
+                result = await launch_local_browser(
+                    "http://127.0.0.1:9333",
+                    custom_command="bridge-browser --background",
+                )
+                self.assertTrue(result)
+                kwargs = spawn.await_args.kwargs
+                self.assertEqual(kwargs["env"]["CHATGPT_BRIDGE_CDP_PORT"], "9333")
 
         asyncio.run(run())
 
