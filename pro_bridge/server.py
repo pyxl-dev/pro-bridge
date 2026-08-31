@@ -8,6 +8,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
 from . import config
+from .browser_guard import launch_local_browser
 from .chatgpt import ChatGPTDriver
 from .conversations import resolve_conversation_reference
 from .identity import resolve_session
@@ -45,6 +46,26 @@ _sessions = SessionStore(config.SESSION_FILE)
 # The browser driver already serializes its own work; this outer lock prevents a
 # concurrent reset/rebind from racing between lookup and persistence.
 _session_lock = asyncio.Lock()
+_browser_guard_lock = asyncio.Lock()
+
+
+async def _ensure_browser_available() -> None:
+    """Best-effort auto-start for the dedicated local CDP browser."""
+    if not config.AUTO_START_BROWSER:
+        return
+
+    async with _browser_guard_lock:
+        available = await launch_local_browser(
+            config.CDP_URL,
+            timeout=config.BROWSER_START_TIMEOUT,
+            custom_command=config.BROWSER_START_COMMAND or None,
+        )
+        if available:
+            return
+
+        # A False result means the configured CDP endpoint is remote/non-local.
+        # Never attempt to launch a local browser for a remote browser config.
+        log.debug("Browser auto-start skipped for non-local CDP URL %s", config.CDP_URL)
 
 
 def _effective_session(session: str | None, ctx: Context) -> tuple[str | None, str]:
@@ -93,6 +114,9 @@ async def chatgpt_ask(
     If no profile mapping, conversation_id, or conversation_url is available,
     the call starts a new ChatGPT conversation.
 
+    If the dedicated local browser was closed, the bridge attempts to relaunch
+    it automatically before performing the call.
+
     Returns {text, model, conversation_id, session, session_source,
     conversation_source}.
     """
@@ -101,6 +125,8 @@ async def chatgpt_ask(
         conversation_id,
         conversation_url,
     )
+
+    await _ensure_browser_available()
 
     async with _session_lock:
         mapped_conversation = None
@@ -158,6 +184,7 @@ async def chatgpt_new_chat(
     session. The next chatgpt_ask starts a new conversation and stores its id.
     """
     effective_session, session_source = _effective_session(session, ctx)
+    await _ensure_browser_available()
 
     async with _session_lock:
         previous = _sessions.reset(effective_session) if effective_session else None
@@ -186,6 +213,7 @@ async def chatgpt_status(
 ) -> dict:
     """Return bridge status and the caller profile's mapped ChatGPT thread."""
     effective_session, session_source = _effective_session(session, ctx)
+    await _ensure_browser_available()
 
     async with _session_lock:
         result = await _driver.status()
@@ -240,13 +268,15 @@ def main():
     app = RewriteHost(app)
     log.info(
         "ChatGPT web MCP listening on http://%s:%s/mcp "
-        "(token=%s, model_slug=%s, sessions=%s, identity_header=%s)",
+        "(token=%s, model_slug=%s, sessions=%s, identity_header=%s, "
+        "browser_autostart=%s)",
         config.HOST,
         config.PORT,
         "set" if config.TOKEN else "NONE",
         config.MODEL_SLUG or "default/current",
         config.SESSION_FILE,
         config.IDENTITY_HEADER,
+        "on" if config.AUTO_START_BROWSER else "off",
     )
     uvicorn.run(app, host=config.HOST, port=config.PORT)
 
