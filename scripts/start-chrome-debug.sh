@@ -2,30 +2,30 @@
 # Launch the dedicated Chromium-family browser used by ChatGPT Web Bridge.
 # macOS / Linux. Windows users: use start-chrome-debug.ps1.
 #
-# Default: headless (no window/focus stealing).
+# Default: background headed browser. On macOS the real browser is launched
+# hidden, so ChatGPT sees a normal browser while it does not steal focus.
 # Login:   ./scripts/start-chrome-debug.sh --login
 # Stop:    ./scripts/start-chrome-debug.sh --stop
+# Headless is retained only for diagnostics; ChatGPT may serve a verification
+# page to HeadlessChrome instead of hydrating the application.
 #
-# Headless and login mode use the SAME persistent browser profile, so logging in
-# once in visible mode also authenticates later headless runs.
-#
-# Override the browser with:
-#   BROWSER="/Applications/Brave Browser.app/Contents/MacOS/Brave Browser" \
-#     ./scripts/start-chrome-debug.sh
+# All modes use the SAME persistent browser profile.
 set -euo pipefail
 
-MODE="headless"
+MODE="background"
 case "${1:-}" in
-  ""|--headless) MODE="headless" ;;
+  ""|--background) MODE="background" ;;
   --login) MODE="login" ;;
+  --headless) MODE="headless" ;;
   --stop) MODE="stop" ;;
   -h|--help)
     cat <<'EOF'
-Usage: ./scripts/start-chrome-debug.sh [--headless|--login|--stop]
+Usage: ./scripts/start-chrome-debug.sh [--background|--login|--headless|--stop]
 
-  --headless  Start the dedicated browser without a visible window (default).
-  --login     Start the same persistent profile visibly so you can log in.
-  --stop      Stop the browser instance started for this dedicated profile.
+  --background  Start a normal browser hidden/in-background (default).
+  --login       Start the same persistent profile visibly so you can log in.
+  --headless    Start Chromium headless (diagnostic only; ChatGPT may block it).
+  --stop        Stop the browser instance for this dedicated profile.
 EOF
     exit 0
     ;;
@@ -45,27 +45,30 @@ cdp_alive() {
   curl -s -o /dev/null -m 1 "http://127.0.0.1:${PORT}/json/version"
 }
 
+profile_pids() {
+  pgrep -f -- "--user-data-dir=${PROFILE}" 2>/dev/null || true
+}
+
 if [ "$MODE" = "stop" ]; then
-  if [ -f "$PIDFILE" ]; then
-    pid="$(cat "$PIDFILE" 2>/dev/null || true)"
-    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-      echo "Stopping bridge browser (PID $pid)..."
-      kill "$pid"
-      for _ in $(seq 1 30); do
-        kill -0 "$pid" 2>/dev/null || break
-        sleep 0.1
-      done
-      if kill -0 "$pid" 2>/dev/null; then
-        echo "Bridge browser did not stop cleanly; forcing it." >&2
-        kill -9 "$pid" 2>/dev/null || true
-      fi
-    else
-      echo "Recorded bridge browser process is no longer running."
+  pids="$(profile_pids)"
+  if [ -n "$pids" ]; then
+    echo "Stopping bridge browser..."
+    # shellcheck disable=SC2086
+    kill $pids 2>/dev/null || true
+    for _ in $(seq 1 30); do
+      sleep 0.1
+      [ -z "$(profile_pids)" ] && break
+    done
+    remaining="$(profile_pids)"
+    if [ -n "$remaining" ]; then
+      echo "Bridge browser did not stop cleanly; forcing it." >&2
+      # shellcheck disable=SC2086
+      kill -9 $remaining 2>/dev/null || true
     fi
     rm -f "$PIDFILE"
   elif cdp_alive; then
-    echo "A browser is listening on CDP port $PORT, but no bridge PID is recorded." >&2
-    echo "Close that dedicated browser manually before switching modes." >&2
+    echo "A browser is listening on CDP port $PORT, but it does not match the bridge profile." >&2
+    echo "Close that browser manually before switching modes." >&2
     exit 1
   else
     echo "Bridge browser is not running."
@@ -112,16 +115,48 @@ args=(
   --user-data-dir="$PROFILE"
   --no-first-run
   --no-default-browser-check
+  --disable-background-timer-throttling
+  --disable-backgrounding-occluded-windows
+  --disable-renderer-backgrounding
 )
 
 if [ "$MODE" = "headless" ]; then
   args+=(--headless=new --window-size=1440,1000)
+elif [ "$MODE" = "background" ] && [ "$(uname -s)" != "Darwin" ]; then
+  # Best effort on Linux. macOS uses `open -gj` below, which is more reliable
+  # at preventing focus stealing while keeping a genuine headed browser.
+  args+=(--start-minimized)
 fi
 
 echo "Starting bridge browser: $bin"
 echo "  mode: $MODE   CDP port: $PORT"
 echo "  profile: $PROFILE"
 
-# exec keeps the shell PID as the browser PID, which makes --stop reliable.
+if [ "$(uname -s)" = "Darwin" ] && [ "$MODE" = "background" ]; then
+  # Extract the .app bundle from a standard macOS Chromium executable path.
+  app_bundle="${bin%%/Contents/MacOS/*}"
+  if [[ "$app_bundle" == *.app ]] && [ -d "$app_bundle" ]; then
+    echo "  macOS: launching genuine browser hidden and without focus"
+    open -gj -n "$app_bundle" --args "${args[@]}" "https://chatgpt.com/"
+
+    # `open` returns immediately. Wait for CDP so callers can use the bridge as
+    # soon as this script exits.
+    for _ in $(seq 1 100); do
+      if cdp_alive; then
+        echo "Bridge browser ready on CDP port $PORT."
+        exit 0
+      fi
+      sleep 0.1
+    done
+    echo "Browser launched but CDP did not become ready on port $PORT." >&2
+    exit 1
+  fi
+
+  echo "Could not resolve a macOS .app bundle from '$bin'; falling back to direct launch." >&2
+fi
+
+# Login/headless/Linux fallback: run the browser in the foreground process.
+# exec keeps signal handling simple. The dedicated user-data-dir still isolates
+# this browser from the user's everyday profile.
 echo "$$" > "$PIDFILE"
 exec "$bin" "${args[@]}" "https://chatgpt.com/"
