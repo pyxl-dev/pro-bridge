@@ -63,10 +63,18 @@ def _effective_session(session: str | None, ctx: Context) -> tuple[str | None, s
 async def chatgpt_ask(
     prompt: str,
     ctx: Context,
+    files: list[str] | None = None,
     session: str | None = None,
     conversation_id: str | None = None,
 ) -> dict:
     """Ask ChatGPT through the logged-in web UI and return the complete reply.
+
+    `files` optionally attaches local files to the SAME ChatGPT message as the
+    prompt. Supply filesystem paths visible to the machine running pro-bridge;
+    absolute paths are strongly recommended. The bridge validates each path,
+    uploads all files through ChatGPT's composer, waits for them to become ready,
+    then sends the prompt. The result includes `attached_files` with the uploaded
+    basenames.
 
     With Hermes, caller identity is normally automatic: configure the MCP server
     with an identity header sourced from the active Hermes profile. The bridge
@@ -85,9 +93,10 @@ async def chatgpt_ask(
     If no profile header, session, or conversation_id is available, the call is
     stateless and starts a new ChatGPT conversation.
 
-    Returns {text, model, conversation_id, session, session_source}.
+    Returns {text, model, conversation_id, attached_files, session, session_source}.
     """
     effective_session, session_source = _effective_session(session, ctx)
+    file_count = len(files or [])
 
     async with _session_lock:
         mapped_conversation = None
@@ -96,15 +105,16 @@ async def chatgpt_ask(
 
         resolved_conversation = conversation_id or mapped_conversation
         log.info(
-            "chatgpt_ask: %d chars, session=%s source=%s conv=%s%s",
+            "chatgpt_ask: %d chars, files=%d, session=%s source=%s conv=%s%s",
             len(prompt),
+            file_count,
             effective_session,
             session_source,
             resolved_conversation,
             " (mapped)" if mapped_conversation and not conversation_id else "",
         )
 
-        result = await _driver.ask(prompt, resolved_conversation)
+        result = await _driver.ask(prompt, resolved_conversation, files=files)
 
         if effective_session:
             _sessions.set(effective_session, result["conversation_id"])
@@ -112,8 +122,9 @@ async def chatgpt_ask(
         result["session"] = effective_session
         result["session_source"] = session_source
         log.info(
-            "chatgpt_ask done: model=%s session=%s conv=%s, %d chars",
+            "chatgpt_ask done: model=%s files=%d session=%s conv=%s, %d chars",
             result.get("model"),
+            len(result.get("attached_files", [])),
             effective_session,
             result.get("conversation_id"),
             len(result.get("text", "")),
