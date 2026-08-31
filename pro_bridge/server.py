@@ -1,4 +1,5 @@
 """MCP server exposing an authenticated ChatGPT web session as tools."""
+import asyncio
 import logging
 
 import uvicorn
@@ -8,6 +9,7 @@ from starlette.responses import JSONResponse
 
 from . import config
 from .chatgpt import ChatGPTDriver
+from .sessions import SessionStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -35,40 +37,106 @@ except TypeError:
     mcp = FastMCP("chatgpt-web")
 
 _driver = ChatGPTDriver()
+_sessions = SessionStore(config.SESSION_FILE)
+
+# Session lookup + browser ask + mapping update must be one logical operation.
+# The browser driver already serializes its own work; this outer lock prevents a
+# concurrent reset/rebind from racing between lookup and persistence.
+_session_lock = asyncio.Lock()
 
 
 @mcp.tool()
-async def chatgpt_ask(prompt: str, conversation_id: str | None = None) -> dict:
+async def chatgpt_ask(
+    prompt: str,
+    session: str | None = None,
+    conversation_id: str | None = None,
+) -> dict:
     """Ask ChatGPT through the logged-in web UI and return the complete reply.
 
-    Omit conversation_id to start a NEW ChatGPT conversation.
-    Pass a conversation_id returned by an earlier call to continue that exact
-    thread. Calls are serialized so multiple agents cannot interleave browser
-    input.
+    Recommended multi-agent usage: pass a stable `session` name for the caller
+    (for example the Hermes profile name). The bridge remembers the ChatGPT
+    conversation id for that session and automatically resumes it on later
+    calls. If the session has no mapping yet, a new ChatGPT conversation is
+    created and then persisted.
 
-    Returns {text, model, conversation_id}.
+    `conversation_id` remains available as an advanced/manual override. If both
+    `session` and `conversation_id` are supplied, that exact conversation is
+    continued and the session is rebound to it after a successful answer.
+
+    If neither `session` nor `conversation_id` is supplied, every call starts a
+    new ChatGPT conversation (legacy/stateless behavior).
+
+    Returns {text, model, conversation_id, session}.
     """
-    log.info("chatgpt_ask: %d chars, conv=%s", len(prompt), conversation_id)
-    result = await _driver.ask(prompt, conversation_id)
-    log.info(
-        "chatgpt_ask done: model=%s conv=%s, %d chars",
-        result.get("model"),
-        result.get("conversation_id"),
-        len(result.get("text", "")),
-    )
-    return result
+    async with _session_lock:
+        mapped_conversation = None
+        if session:
+            mapped_conversation = _sessions.get(session)
+
+        resolved_conversation = conversation_id or mapped_conversation
+        log.info(
+            "chatgpt_ask: %d chars, session=%s, conv=%s%s",
+            len(prompt),
+            session,
+            resolved_conversation,
+            " (mapped)" if mapped_conversation and not conversation_id else "",
+        )
+
+        result = await _driver.ask(prompt, resolved_conversation)
+
+        if session:
+            _sessions.set(session, result["conversation_id"])
+
+        result["session"] = session
+        log.info(
+            "chatgpt_ask done: model=%s session=%s conv=%s, %d chars",
+            result.get("model"),
+            session,
+            result.get("conversation_id"),
+            len(result.get("text", "")),
+        )
+        return result
 
 
 @mcp.tool()
-async def chatgpt_new_chat() -> dict:
-    """Navigate the bridge browser to a fresh ChatGPT conversation."""
-    return await _driver.new_chat()
+async def chatgpt_new_chat(session: str | None = None) -> dict:
+    """Start fresh, optionally resetting one named agent session.
+
+    Pass the caller's stable `session` name to forget its previous ChatGPT
+    conversation. The old ChatGPT thread is not deleted; it is simply detached
+    from this session. The next `chatgpt_ask(..., session=...)` starts a new
+    conversation and stores its new id automatically.
+
+    With no session, this only navigates the bridge browser to ChatGPT's generic
+    new-chat page and does not alter any named mappings.
+    """
+    async with _session_lock:
+        previous = _sessions.reset(session) if session else None
+        result = await _driver.new_chat()
+        result.update(
+            {
+                "session": session,
+                "previous_conversation_id": previous,
+                "reset": bool(session),
+            }
+        )
+        log.info(
+            "chatgpt_new_chat: session=%s previous=%s",
+            session,
+            previous,
+        )
+        return result
 
 
 @mcp.tool()
-async def chatgpt_status() -> dict:
-    """Return bridge connection, current URL, model (if known), and chat id."""
-    return await _driver.status()
+async def chatgpt_status(session: str | None = None) -> dict:
+    """Return bridge status and, optionally, one named session's mapped chat id."""
+    async with _session_lock:
+        result = await _driver.status()
+        result["session"] = session
+        result["session_conversation_id"] = _sessions.get(session) if session else None
+        result["session_count"] = len(_sessions.snapshot())
+        return result
 
 
 class TokenAuth(BaseHTTPMiddleware):
@@ -111,11 +179,13 @@ def main():
     app.add_middleware(TokenAuth)
     app = RewriteHost(app)
     log.info(
-        "ChatGPT web MCP listening on http://%s:%s/mcp (token=%s, model_slug=%s)",
+        "ChatGPT web MCP listening on http://%s:%s/mcp "
+        "(token=%s, model_slug=%s, sessions=%s)",
         config.HOST,
         config.PORT,
         "set" if config.TOKEN else "NONE",
         config.MODEL_SLUG or "default/current",
+        config.SESSION_FILE,
     )
     uvicorn.run(app, host=config.HOST, port=config.PORT)
 
