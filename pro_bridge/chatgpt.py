@@ -6,14 +6,12 @@ serializes browser actions, and threads conversations by their /c/<uuid> URL.
 """
 import asyncio
 import logging
-import os
 import re
 import time
 
 from playwright.async_api import async_playwright
 
 from . import config
-from .attachments import normalize_file_paths
 
 log = logging.getLogger("pro_bridge.chatgpt")
 
@@ -27,8 +25,8 @@ class ChatGPTDriver:
         self._pw = None
         self._browser = None
         # One browser tab is a shared mutable resource. Serialize all operations
-        # so concurrent MCP clients cannot interleave prompts, uploads, or
-        # navigation over each other.
+        # so concurrent MCP clients cannot interleave prompts or navigate over
+        # each other's conversations.
         self._lock = asyncio.Lock()
 
     async def _ensure(self):
@@ -118,11 +116,9 @@ class ChatGPTDriver:
             page = await self._get_page(fresh=True)
             return {"url": page.url, "conversation_id": None}
 
-    async def ask(self, prompt, conversation_id=None, files=None):
+    async def ask(self, prompt, conversation_id=None):
         if not prompt or not prompt.strip():
             raise ValueError("prompt must not be empty")
-
-        file_paths = normalize_file_paths(files)
 
         async with self._lock:
             # No conversation id means a NEW conversation by contract. This
@@ -148,18 +144,7 @@ class ChatGPTDriver:
             page.on("request", on_request)
             try:
                 before = await page.locator(ASSISTANT).count()
-                try:
-                    await self._send(page, prompt, file_paths)
-                except Exception:
-                    # An attachment failure can leave a half-filled composer or
-                    # partially-added file chip behind. Reload the requested thread
-                    # before propagating the error so the next agent starts clean.
-                    try:
-                        await page.reload(wait_until="domcontentloaded")
-                    except Exception:
-                        pass
-                    raise
-
+                await self._send(page, prompt)
                 await page.wait_for_function(
                     "n => document.querySelectorAll"
                     "('[data-message-author-role=assistant]').length > n",
@@ -182,12 +167,7 @@ class ChatGPTDriver:
                     "ChatGPT answered but no conversation id was found in the URL."
                 )
 
-            return {
-                "text": text,
-                "model": model,
-                "conversation_id": conv,
-                "attached_files": [os.path.basename(path) for path in file_paths],
-            }
+            return {"text": text, "model": model, "conversation_id": conv}
 
     async def _extract_answer(self, page):
         loc = page.locator(ASSISTANT).last
@@ -208,18 +188,14 @@ class ChatGPTDriver:
             raise RuntimeError("Latest ChatGPT assistant turn contains no text.")
         return text
 
-    async def _composer(self, page):
+    async def _send(self, page, prompt):
         composer = page.locator("#prompt-textarea")
         try:
             await composer.wait_for(state="visible", timeout=30000)
-            return composer
         except Exception:
             composer = page.get_by_role("textbox").first
             await composer.wait_for(state="visible", timeout=30000)
-            return composer
 
-    async def _fill_composer(self, page, prompt):
-        composer = await self._composer(page)
         await composer.click()
         try:
             await composer.fill(prompt)
@@ -233,123 +209,23 @@ class ChatGPTDriver:
             except Exception:
                 pass
             await page.keyboard.insert_text(prompt)
-        return composer
 
-    async def _file_input(self, page):
-        inputs = page.locator('input[type="file"]')
-        if await inputs.count():
-            return inputs.last
-
-        # ChatGPT normally keeps a hidden file input in/near the composer. If a
-        # UI revision only creates it after opening the + / attachment menu,
-        # trigger that menu and look again. These selectors are deliberately
-        # semantic/fuzzy because labels vary between ChatGPT revisions/locales.
-        for selector in (
-            'button[data-testid="composer-plus-btn"]',
-            'button[aria-label*="attach" i]',
-            'button[aria-label*="file" i]',
-            'button[aria-label*="upload" i]',
-        ):
-            try:
-                button = page.locator(selector).first
-                if await button.count() and await button.is_visible():
-                    await button.click()
-                    await asyncio.sleep(0.3)
-                    if await inputs.count():
-                        return inputs.last
-            except Exception:
-                continue
-
-        raise RuntimeError(
-            "ChatGPT file input was not found. The web upload UI may have changed."
-        )
-
-    async def _attachments_visible(self, page, names):
-        """Best-effort confirmation that each selected file has a composer chip."""
-        try:
-            return await page.evaluate(
-                """(names) => {
-                    const root = document.querySelector('#prompt-textarea')?.parentElement
-                        ?.parentElement?.parentElement || document.body;
-                    const text = (root.innerText || document.body.innerText || '');
-                    return names.every((name) => text.includes(name));
-                }""",
-                names,
-            )
-        except Exception:
-            return False
-
-    async def _send_button(self, page):
         for selector in (
             '[data-testid="send-button"]',
             'button[aria-label*="Send" i]',
         ):
             try:
-                button = page.locator(selector).first
-                if await button.count() and await button.is_visible():
-                    return button
-            except Exception:
-                continue
-        return None
-
-    async def _attach_files(self, page, file_paths):
-        if not file_paths:
-            return
-
-        file_input = await self._file_input(page)
-        await file_input.set_input_files(file_paths)
-
-        names = [os.path.basename(path) for path in file_paths]
-        deadline = time.time() + config.UPLOAD_TIMEOUT
-        visible_since = None
-
-        while time.time() < deadline:
-            chips_visible = await self._attachments_visible(page, names)
-            if chips_visible and visible_since is None:
-                visible_since = time.time()
-
-            # With prompt text already filled, ChatGPT's send control becomes
-            # enabled only after selected attachments are usable. This is our
-            # strongest UI-level readiness signal without relying on private
-            # upload endpoints.
-            button = await self._send_button(page)
-            if chips_visible and button is not None:
-                try:
-                    if await button.is_enabled():
-                        return
-                except Exception:
-                    pass
-
-            # DOM fallback for revisions that hide/replace the normal send
-            # button. Once all attachment chips have remained visible for a few
-            # seconds, treat them as settled rather than blocking forever.
-            if chips_visible and visible_since and time.time() - visible_since >= 5:
-                return
-
-            await asyncio.sleep(0.5)
-
-        raise TimeoutError(
-            "ChatGPT attachments did not become ready within "
-            f"{config.UPLOAD_TIMEOUT} seconds: {', '.join(names)}"
-        )
-
-    async def _send(self, page, prompt, file_paths=None):
-        composer = await self._fill_composer(page, prompt)
-
-        if file_paths:
-            await self._attach_files(page, file_paths)
-
-        button = await self._send_button(page)
-        if button is not None:
-            try:
-                if await button.is_enabled():
-                    await button.click()
+                button = page.locator(selector)
+                if (
+                    await button.count()
+                    and await button.first.is_visible()
+                    and await button.first.is_enabled()
+                ):
+                    await button.first.click()
                     return
             except Exception:
-                pass
+                continue
 
-        # Enter is retained as a UI-drift fallback. For calls with attachments,
-        # _attach_files has already waited for the file chips to settle first.
         await composer.press("Enter")
 
     async def _completion_state(self, page):

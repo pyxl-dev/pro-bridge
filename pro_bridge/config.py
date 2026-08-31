@@ -63,15 +63,6 @@ SESSION_FILE = os.path.expanduser(
     )
 )
 
-# Max seconds to wait for selected files to become usable in the ChatGPT
-# composer before the message is sent.
-UPLOAD_TIMEOUT = int(
-    os.environ.get(
-        "CHATGPT_BRIDGE_UPLOAD_TIMEOUT",
-        os.environ.get("PRO_BRIDGE_UPLOAD_TIMEOUT", "180"),
-    )
-)
-
 # Max seconds to wait for one answer.
 ANSWER_TIMEOUT = int(
     os.environ.get(
