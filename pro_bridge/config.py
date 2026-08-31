@@ -37,6 +37,13 @@ PORT = int(_env("CHATGPT_BRIDGE_PORT", "PRO_BRIDGE_PORT", "8765"))
 # Shared secret. If set, callers must send Authorization: Bearer <TOKEN>.
 TOKEN = _env("CHATGPT_BRIDGE_TOKEN", "PRO_BRIDGE_TOKEN", "")
 
+# HTTP header carrying the MCP caller identity. Hermes can populate this
+# automatically from its active profile with identity_header.value_from=profile.
+IDENTITY_HEADER = os.environ.get(
+    "CHATGPT_BRIDGE_IDENTITY_HEADER",
+    "X-Hermes-Profile",
+).strip() or "X-Hermes-Profile"
+
 # Optional: force a model slug on NEW chats. Empty means use ChatGPT's current
 # account/default behavior. The driver still reports the model that answered
 # when ChatGPT exposes data-message-model-slug.
