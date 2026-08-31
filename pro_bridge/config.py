@@ -45,6 +45,17 @@ MODEL_SLUG = os.environ.get(
     os.environ.get("GPT_PRO_MODEL_SLUG", ""),
 )
 
+# Persistent mapping of named caller sessions (for example Hermes profiles) to
+# ChatGPT conversation ids. This deliberately lives outside the repository so
+# git pulls/checkouts never erase agent continuity.
+SESSION_FILE = os.path.expanduser(
+    _env(
+        "CHATGPT_BRIDGE_SESSION_FILE",
+        "PRO_BRIDGE_SESSION_FILE",
+        "~/.pro-bridge/sessions.json",
+    )
+)
+
 # Max seconds to wait for one answer.
 ANSWER_TIMEOUT = int(
     os.environ.get(
