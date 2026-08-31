@@ -8,17 +8,70 @@ model. The bridge drives `chatgpt.com` over Chrome DevTools Protocol (CDP),
 waits for the visible assistant turn to finish, and returns the reply together
 with its `conversation_id`.
 
-## Current V0.3
+## Current V0.4
 
 The MCP server exposes three tools:
 
 | Tool | Purpose |
 |---|---|
-| `chatgpt_ask(prompt, session?, conversation_id?)` | Ask ChatGPT. Hermes profiles are automatically routed to their own persistent ChatGPT thread. |
+| `chatgpt_ask(prompt, files?, session?, conversation_id?)` | Ask ChatGPT, optionally attaching local files to the same message. Hermes profiles are automatically routed to their own persistent ChatGPT thread. |
 | `chatgpt_new_chat(session?)` | Detach the caller profile from its current thread so its next message starts fresh. |
 | `chatgpt_status(session?)` | Check browser state and the caller profile's mapped conversation. |
 
-File upload and image generation are intentionally left for the next milestone.
+Image generation/download remains deferred to the next milestone.
+
+## File attachments
+
+Agents can attach one or more local files directly to a ChatGPT message:
+
+```text
+chatgpt_ask(
+  prompt="Analyse ces documents et compare leurs conclusions.",
+  files=[
+    "/absolute/path/report.pdf",
+    "/absolute/path/notes.docx"
+  ]
+)
+```
+
+`files` contains filesystem paths on the machine running `pro-bridge`.
+Absolute paths are strongly recommended; relative paths are resolved against the
+bridge process working directory.
+
+Before touching the browser, the bridge:
+
+1. expands `~` and resolves each path to an absolute path;
+2. rejects missing paths and directories;
+3. removes duplicate paths while preserving order;
+4. fills the prompt;
+5. selects the files through ChatGPT's real `input[type=file]` composer control;
+6. waits for the attachment chips to appear and settle before sending;
+7. returns the uploaded basenames in `attached_files`.
+
+Example result shape:
+
+```json
+{
+  "text": "...",
+  "model": "gpt-5-6-thinking",
+  "conversation_id": "...",
+  "attached_files": ["report.pdf", "notes.docx"],
+  "session": "developer",
+  "session_source": "header"
+}
+```
+
+Uploads are covered by the same browser/session lock as normal messages, so a
+second Hermes agent cannot navigate or type over another agent while its files
+are being attached.
+
+If attachment preparation fails before send, the bridge reloads the current
+ChatGPT thread before returning the error so stale prompt text or partially
+attached files do not contaminate the next call.
+
+The bridge does not bypass ChatGPT's own file type, size, account, or quota
+limits. If ChatGPT rejects a file, the tool call fails rather than pretending it
+was attached.
 
 ## Automatic Hermes profile sessions
 
@@ -106,11 +159,12 @@ The original project was centered on GPT Pro. This fork generalizes the bridge
 for ordinary ChatGPT usage:
 
 - no GPT Pro requirement or strict-model rejection;
+- prompt + local file attachments in the same MCP call;
 - automatic Hermes profile identity via HTTP MCP header;
 - persistent `profile -> conversation_id` routing for multi-agent Hermes;
 - `conversation_id=None` starts a new conversation when no named mapping exists;
-- browser actions are serialized so multiple agents cannot type into the same
-  composer simultaneously;
+- browser actions and uploads are serialized so multiple agents cannot type or
+  attach files into the same composer simultaneously;
 - completion detection combines semantic assistant turns, Copy/Stop state, and
   conservative text stability;
 - timeouts fail explicitly rather than returning potentially partial output;
@@ -185,6 +239,14 @@ Full text round-trip:
 python selftest.py "Reply with exactly one word: PONG"
 ```
 
+Manual file-upload smoke test:
+
+```bash
+python debug_ask.py --file /absolute/path/test.txt "Tell me the first line of the attached file."
+```
+
+Repeat `--file` to attach multiple files.
+
 Start the MCP server:
 
 ```bash
@@ -203,6 +265,7 @@ python -m pro_bridge.server
 | `CHATGPT_BRIDGE_IDENTITY_HEADER` | `X-Hermes-Profile` | HTTP header containing caller profile identity |
 | `CHATGPT_MODEL_SLUG` | _(empty)_ | optional model slug for new chats |
 | `CHATGPT_BRIDGE_SESSION_FILE` | `~/.pro-bridge/sessions.json` | persistent profile/session registry |
+| `CHATGPT_BRIDGE_UPLOAD_TIMEOUT` | `180` | max seconds for attachments to become ready |
 | `CHATGPT_BRIDGE_TIMEOUT` | `1800` | max seconds per answer |
 
 Legacy `PRO_BRIDGE_*`, `PRO_BRIDGE_TIMEOUT`, and `GPT_PRO_MODEL_SLUG` variables
@@ -211,9 +274,9 @@ are accepted as fallbacks.
 ## Concurrency
 
 The browser is a single mutable UI. The bridge serializes calls with locks so
-separate Hermes agents cannot navigate/type over one another. Profile sessions
-provide logical conversation isolation; calls are still executed sequentially
-through the single browser worker.
+separate Hermes agents cannot navigate, type, or upload over one another.
+Profile sessions provide logical conversation isolation; calls are still
+executed sequentially through the single browser worker.
 
 ## Diagnostics
 
@@ -221,6 +284,7 @@ through the single browser worker.
 python -m unittest discover -s tests
 python selftest.py
 python debug_ask.py "Reply with one word: PONG"
+python debug_ask.py --file /absolute/path/test.txt "Read the attached file."
 python probe_dom.py
 ```
 
@@ -228,7 +292,7 @@ python probe_dom.py
 
 ## Next milestone
 
-- [ ] upload files through ChatGPT;
+- [x] upload files through ChatGPT;
 - [ ] generate/download images;
 - [ ] optional reference-image support;
 - [ ] automated DOM smoke tests;
@@ -238,6 +302,8 @@ python probe_dom.py
 
 - Keep the dedicated browser profile private: it contains an authenticated
   ChatGPT session.
+- File paths are read with the bridge process permissions. Only expose this MCP
+  tool to agents you trust with the files accessible to that process.
 - Keep the MCP server on localhost unless remote access is genuinely needed.
 - If remote access is needed, use a private network plus a bearer token.
 - Treat identity headers as routing hints, not authentication. For remote access,
