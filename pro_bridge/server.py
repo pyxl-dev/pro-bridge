@@ -9,6 +9,7 @@ from starlette.responses import JSONResponse
 
 from . import config
 from .chatgpt import ChatGPTDriver
+from .conversations import resolve_conversation_reference
 from .identity import resolve_session
 from .sessions import SessionStore
 
@@ -65,6 +66,7 @@ async def chatgpt_ask(
     ctx: Context,
     session: str | None = None,
     conversation_id: str | None = None,
+    conversation_url: str | None = None,
 ) -> dict:
     """Ask ChatGPT through the logged-in web UI and return the complete reply.
 
@@ -74,34 +76,52 @@ async def chatgpt_ask(
     conversation, so each Hermes profile keeps independent context without the
     model having to pass a session name.
 
+    To hand an existing ChatGPT thread to an agent, pass its normal authenticated
+    URL as `conversation_url`, for example
+    `https://chatgpt.com/c/<conversation-id>`. The bridge extracts the UUID and,
+    after a successful answer, rebinds the calling Hermes profile to that thread.
+    Later calls from that profile continue it automatically without the URL.
+
+    `conversation_id` remains available as the lower-level equivalent. If both
+    `conversation_id` and `conversation_url` are supplied, they must identify the
+    same thread or the call fails explicitly.
+
     `session` is only a fallback for clients that do not send the identity
     header. When the header is present it wins, preventing an agent from routing
     itself into another profile's thread by passing the wrong session value.
 
-    `conversation_id` remains an advanced/manual override. When a named profile
-    or fallback session is resolved, a successful explicit continuation rebinds
-    that session to the resulting conversation id.
+    If no profile mapping, conversation_id, or conversation_url is available,
+    the call starts a new ChatGPT conversation.
 
-    If no profile header, session, or conversation_id is available, the call is
-    stateless and starts a new ChatGPT conversation.
-
-    Returns {text, model, conversation_id, session, session_source}.
+    Returns {text, model, conversation_id, session, session_source,
+    conversation_source}.
     """
     effective_session, session_source = _effective_session(session, ctx)
+    explicit_conversation, explicit_source = resolve_conversation_reference(
+        conversation_id,
+        conversation_url,
+    )
 
     async with _session_lock:
         mapped_conversation = None
         if effective_session:
             mapped_conversation = _sessions.get(effective_session)
 
-        resolved_conversation = conversation_id or mapped_conversation
+        resolved_conversation = explicit_conversation or mapped_conversation
+        if explicit_conversation:
+            conversation_source = explicit_source
+        elif mapped_conversation:
+            conversation_source = "mapped"
+        else:
+            conversation_source = "new"
+
         log.info(
-            "chatgpt_ask: %d chars, session=%s source=%s conv=%s%s",
+            "chatgpt_ask: %d chars, session=%s source=%s conv=%s conv_source=%s",
             len(prompt),
             effective_session,
             session_source,
             resolved_conversation,
-            " (mapped)" if mapped_conversation and not conversation_id else "",
+            conversation_source,
         )
 
         result = await _driver.ask(prompt, resolved_conversation)
@@ -111,6 +131,7 @@ async def chatgpt_ask(
 
         result["session"] = effective_session
         result["session_source"] = session_source
+        result["conversation_source"] = conversation_source
         log.info(
             "chatgpt_ask done: model=%s session=%s conv=%s, %d chars",
             result.get("model"),
