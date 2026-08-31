@@ -1,5 +1,7 @@
 # pro-bridge runtime deps. No `playwright install` needed — we attach to your
 # existing Chrome over CDP rather than downloading a browser.
 playwright>=1.40
-mcp>=1.2
+# server.py currently targets the MCP Python SDK v1 FastMCP API.
+# Keep the upper bound until the server is explicitly migrated to MCP SDK v2.
+mcp>=1.2,<2
 uvicorn>=0.27
